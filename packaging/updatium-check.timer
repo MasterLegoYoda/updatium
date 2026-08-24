@@ -1,0 +1,13 @@
+# /etc/systemd/system/updatium-check.timer
+# Ships with updatium but is NOT auto-installed.
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now updatium-check.timer
+[Unit]
+Description=Run updatium check twice daily
+
+[Timer]
+OnCalendar=*-*-* 09:00,19:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

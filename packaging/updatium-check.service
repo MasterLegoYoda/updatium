@@ -1,0 +1,16 @@
+# /etc/systemd/system/updatium-check.service
+# Ships with updatium but is NOT auto-installed. Pair with updatium-check.timer.
+# Add --notify later via a drop-in if you configure notify_cmd.
+[Unit]
+Description=updatium: check all configured apps for updates
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Exit code 2 means "completed with failures or pending approvals" — still fine
+# for a timer; inspect `updatium history` for details.
+ExecStart=%h/.cargo/bin/updatium check --all
+
+[Install]
+WantedBy=default.target

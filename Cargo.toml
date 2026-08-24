@@ -1,0 +1,37 @@
+[package]
+name = "updatium"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+bzip2 = "0.6.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.6", features = ["derive"] }
+clap_complete = "4.6.9"
+crossterm = "0.29.0"
+dirs = "6.0.0"
+flate2 = "1.1.9"
+futures = "0.3.34"
+hex = "0.4.3"
+ratatui = "0.30.2"
+regex = "1.13.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tar = "0.4.46"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.4"
+url = { version = "2.5.8", features = ["serde"] }
+walkdir = "2.5.0"
+xz2 = { version = "0.1.7", features = ["static"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+axum = "0.8.9"
+tempfile = "3.27.0"
