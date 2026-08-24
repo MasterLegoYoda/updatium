@@ -96,6 +96,12 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// List provider and installer plugins (builtins + discovered externals)
+    Plugins {
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the .desktop entry of an app
     Desktop {
         id: String,
@@ -582,6 +588,10 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Plugins { json } => {
+            cmd_plugins(cli, *json)?;
+            Ok(0)
+        }
         Cmd::Desktop { id, remove } => {
             let e = Engine::new(cli.home.as_deref())?;
             if *remove {
@@ -671,4 +681,93 @@ fn first_executable_under(dir: &Path, preferred: &[String]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// `updatium plugins`: list provider and installer registries (builtins +
+/// discovered external executables).
+fn cmd_plugins(cli: &Cli, json: bool) -> Result<()> {
+    let home = crate::config::HomePaths::resolve(cli.home.as_deref())?;
+    let mut global =
+        crate::config::GlobalConfig::load(&home.config_file()).with_context(|| {
+            format!("loading {}", home.config_file().display())
+        })?;
+    global.home = home;
+
+    let providers = crate::provider::describe_registry(&global);
+    let installers = crate::installer::describe_registry(&global);
+
+    if json || cli.json {
+        let prov_json = |p: &crate::provider::PluginInfo| {
+            serde_json::json!({
+                "key": p.key,
+                "kind": p.kind,
+                "path": p.path.as_ref().map(|q| q.display().to_string()),
+            })
+        };
+        let inst_json = |p: &crate::installer::PluginInfo| {
+            serde_json::json!({
+                "key": p.key,
+                "kind": p.kind,
+                "path": p.path.as_ref().map(|q| q.display().to_string()),
+            })
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "providers": providers.iter().map(prov_json).collect::<Vec<_>>(),
+                "installers": installers.iter().map(inst_json).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    // KIND | ID | SOURCE grid in the render_table style.
+    let mut rows: Vec<(&str, &str, String)> = Vec::new();
+    for p in &providers {
+        rows.push(("provider", &p.key, source_str(p.path.as_ref())));
+    }
+    for p in &installers {
+        rows.push(("installer", &p.key, source_str(p.path.as_ref())));
+    }
+    let headers = ["KIND", "ID", "SOURCE"];
+    let mut widths = [0usize; 3];
+    for (i, h) in headers.iter().enumerate() {
+        widths[i] = h.len();
+    }
+    for r in &rows {
+        widths[0] = widths[0].max(r.0.chars().count());
+        widths[1] = widths[1].max(r.1.chars().count());
+        widths[2] = widths[2].max(r.2.chars().count());
+    }
+    let rule = |widths: &[usize; 3]| {
+        let mut out = String::from("+");
+        for w in widths {
+            out.push_str(&"-".repeat(w + 2));
+            out.push('+');
+        }
+        out
+    };
+    let row_str = |cells: [&str; 3], widths: &[usize; 3]| {
+        let mut out = String::from("|");
+        for (c, w) in cells.iter().zip(widths) {
+            out.push(' ');
+            out.push_str(c);
+            out.push_str(&" ".repeat(w - c.chars().count()));
+            out.push_str(" |");
+        }
+        out
+    };
+    println!("{}", rule(&widths));
+    println!("{}", row_str(headers, &widths));
+    println!("{}", rule(&widths));
+    for r in &rows {
+        println!("{}", row_str([r.0, r.1, r.2.as_str()], &widths));
+    }
+    println!("{}", rule(&widths));
+    Ok(())
+}
+
+fn source_str(path: Option<&std::path::PathBuf>) -> String {
+    path.map(|p| p.display().to_string())
+        .unwrap_or_else(|| "builtin".into())
 }

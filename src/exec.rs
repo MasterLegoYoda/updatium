@@ -116,18 +116,22 @@ pub async fn run(
     timeout: Duration,
     capture: bool,
 ) -> Result<RunOut> {
-    run_with_stdin(cmd, cwd, timeout, capture, None).await
+    run_with_stdin(cmd, cwd, timeout, capture, None, &[]).await
 }
 
-/// Like [`run`] but pipes `stdin_bytes` to the child when provided.
+/// Like [`run`] but pipes `stdin_bytes` to the child when provided and
+/// overlays `env` (config-owned key/value pairs) on the inherited environment.
 pub async fn run_with_stdin(
     cmd: &[String],
     cwd: Option<&Path>,
     timeout: Duration,
     capture: bool,
     stdin_bytes: Option<&[u8]>,
+    env: &[(&str, &str)],
 ) -> Result<RunOut> {
-    run_impl(cmd, cwd, timeout, capture, stdin_bytes, &[]).await
+    let env_pairs: Vec<(String, String)> =
+        env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    run_impl(cmd, cwd, timeout, capture, stdin_bytes, &env_pairs).await
 }
 
 /// Like [`run`] but overlays `env` on top of inherited environment variables.

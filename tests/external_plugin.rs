@@ -60,7 +60,7 @@ async fn stub_provider_round_trips_config() {
 }
 
 const STUB_BAD_PROTOCOL: &str = r#"#!/usr/bin/env bash
-echo '{"protocol":2,"id":"future"}'
+echo '{"protocol":3,"id":"future"}'
 "#;
 
 #[tokio::test]

@@ -76,6 +76,7 @@ pub struct Engine {
     store: Store,
     http: reqwest::Client,
     registry: BTreeMap<String, Arc<dyn provider::Provider>>,
+    installers: std::collections::HashMap<String, std::sync::Arc<dyn crate::installer::Installer>>,
     home: HomePaths,
 }
 
@@ -87,14 +88,16 @@ impl Engine {
             .with_context(|| format!("loading {}", cfg_path.display()))?;
         global.home = home.clone();
         let store = Store::open(&home.db_path())?;
-        let http = net::build_client()?;
         let registry: std::collections::BTreeMap<_, _> =
             provider::registry(&global).into_iter().collect();
+        let http = net::build_client()?;
+        let installers = crate::installer::registry(&global);
         Ok(Engine {
             global,
             store,
             http,
             registry,
+            installers,
             home,
         })
     }
@@ -401,7 +404,7 @@ impl Engine {
             }
             SourceKind::External { .. } => {}
         }
-        match app.install.kind {
+        match &app.install.kind {
             InstallType::Appimage => actions.push(format!(
                 "install AppImage to {}",
                 app.install
@@ -414,6 +417,9 @@ impl Engine {
             InstallType::Archive => actions.push("extract + publish bin_glob".into()),
             InstallType::Dir => actions.push("publish artifacts".into()),
             InstallType::None => {}
+            InstallType::External(n) => {
+                actions.push(format!("install via external installer '{n}'"));
+            }
         }
         if let Some(d) = &app.install.desktop {
             actions.push(format!("write desktop entry '{}'", d.name));
@@ -425,7 +431,9 @@ impl Engine {
     fn primary_asset(&self, app: &AppFile, target: &Release) -> Result<Option<provider::Asset>> {
         let wants_assets = matches!(
             app.source_kind,
-            SourceKind::GithubReleases(_) | SourceKind::HtmlLinks(_)
+            SourceKind::GithubReleases(_)
+                | SourceKind::HtmlLinks(_)
+                | SourceKind::External { .. }
         );
         if !wants_assets {
             return Ok(None);
@@ -501,13 +509,14 @@ impl Engine {
                     .push(format!("set installed = {}", target.version));
                 return Ok(());
             }
-            SourceKind::External { .. } => {
-                // External plugins are track-only in this MVP.
+            SourceKind::External { .. } if matches!(app.install.kind, InstallType::None) => {
+                // Track-only: no install requested.
                 self.store.set_installed(&app.id, &target.version)?;
                 rep.actions
                     .push(format!("set installed = {}", target.version));
                 return Ok(());
             }
+            SourceKind::External { .. } => {} // fall through to the asset path
             SourceKind::GithubReleases(_) | SourceKind::HtmlLinks(_) => {}
         }
 
@@ -582,33 +591,29 @@ impl Engine {
             }
         }
 
-        // Steps 5-7: install shape dispatch.
-        match app.install.kind {
-            InstallType::Appimage => {
-                let target_dir = app
-                    .install
-                    .target
-                    .as_deref()
-                    .map(crate::config::expand_tilde)
-                    .unwrap_or_else(|| self.home.default_appimage_target());
-                let dest = installer::install_appimage(&download_path, &asset.name, &target_dir)?;
-                rep.actions.push(format!("installed {}", dest.display()));
-                self.finish_install(app, &dest, rep)?;
+        // Steps 5-7: installer registry dispatch.
+        let inst = installer::lookup(&self.installers, &app.install.kind.key())?;
+        let extra_table = app.install.extra_table();
+        let ctx = installer::InstallCtx {
+            app_id: &app.id,
+            version: &target.version,
+            cfg: &app.install,
+            extra: &extra_table,
+            download: Some(&download_path),
+            filename: Some(&asset.name),
+            checkout: None,
+            artifacts: &[],
+            home: &self.home,
+        };
+        let outcome = inst.install(&ctx).await?;
+        rep.actions.extend(outcome.actions);
+        match outcome.publication {
+            Some(p) => {
+                self.publish_common(app, p, rep)?;
             }
-            InstallType::Archive => {
-                let staging_root = self.home.installs().join(&app.id);
-                let staging = staging_root.join(format!(".staging-{}", target.version));
-                let _ = std::fs::remove_dir_all(&staging);
-                installer::extract_archive(&download_path, &staging)?;
-                installer::strip_single_root_dir(&staging)?;
-                let pubn = installer::publish_from_staging(
-                    &staging,
-                    &app.install,
-                    &self.home.install_current(&app.id),
-                )?;
-                self.publish_common(app, pubn, rep)?;
+            None => {
+                self.finish_install(app, outcome.exec_hint.as_deref(), rep)?;
             }
-            other => bail!("install.type {other:?} not valid for asset-based providers"),
         }
         Ok(())
     }
@@ -745,14 +750,25 @@ impl Engine {
             rep.actions.push(format!("build[{}] ok", step[0]));
         }
 
-        // Step 7: publish artifacts.
-        let pubn = installer::publish_from_checkout(
-            &checkout,
-            &sb.build.artifacts,
-            &self.home.install_current(&app.id),
-        )?;
-        rep.actions
-            .push(format!("published {} artifacts", pubn.published.len()));
+        // Step 7: publish artifacts via the `dir` installer plugin.
+        let inst = installer::lookup(&self.installers, "dir")?;
+        let empty_extra = toml::Value::Table(toml::map::Map::new());
+        let ctx = installer::InstallCtx {
+            app_id: &app.id,
+            version: &target.version,
+            cfg: &app.install,
+            extra: &empty_extra,
+            download: None,
+            filename: None,
+            checkout: Some(&checkout),
+            artifacts: &sb.build.artifacts,
+            home: &self.home,
+        };
+        let outcome = inst.install(&ctx).await?;
+        rep.actions.extend(outcome.actions);
+        let pubn = outcome
+            .publication
+            .context("dir installer returned no publication")?;
         self.publish_common(app, pubn, rep)?;
         self.post_build_finish(app, target, rep).await
     }
@@ -761,7 +777,7 @@ impl Engine {
     fn finish_install(
         &self,
         app: &AppFile,
-        exec_hint: &Path,
+        exec_hint: Option<&Path>,
         rep: &mut UpdateReport,
     ) -> Result<()> {
         self.store.event("install_ok", Some(&app.id), None)?;
@@ -773,17 +789,26 @@ impl Engine {
             let _ = (from, to); // kept for future changelog hooks
         }
         if let Some(d) = &app.install.desktop {
-            let icon = d.icon.as_deref().map(crate::config::expand_tilde);
-            desktop_entry_write(
-                &self.home.desktop_dir,
-                &app.id,
-                &d.name,
-                exec_hint,
-                icon.as_deref(),
-                &d.categories,
-                d.terminal,
-            )?;
-            rep.actions.push(format!("desktop entry '{}'", d.name));
+            match exec_hint {
+                Some(exec) => {
+                    let icon = d.icon.as_deref().map(crate::config::expand_tilde);
+                    desktop_entry_write(
+                        &self.home.desktop_dir,
+                        &app.id,
+                        &d.name,
+                        exec,
+                        icon.as_deref(),
+                        &d.categories,
+                        d.terminal,
+                    )?;
+                    rep.actions.push(format!("desktop entry '{}'", d.name));
+                }
+                None => {
+                    rep.warnings.push(
+                        "desktop requested but installer returned no exec path".into(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1019,6 +1044,7 @@ impl Engine {
                     std::time::Duration::from_secs(30),
                     true,
                     Some(payload_str.as_bytes()),
+                    &[],
                 )
                 .await
             }),

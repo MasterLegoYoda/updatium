@@ -105,6 +105,9 @@ impl HomePaths {
     pub fn providers_d(&self) -> PathBuf {
         self.config_dir.join("providers.d")
     }
+    pub fn installers_d(&self) -> PathBuf {
+        self.config_dir.join("installers.d")
+    }
     pub fn db_path(&self) -> PathBuf {
         self.state_dir.join("state.db")
     }
@@ -240,13 +243,56 @@ impl Default for DigestPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// How the engine installs a release. Builtins cover the three native shapes;
+/// `External(name)` delegates installation to an installer plugin (registry key
+/// `external:<name>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallType {
     Appimage,
     Archive,
     Dir,
     None,
+    External(String),
+}
+
+impl InstallType {
+    /// Registry key: `"appimage"` | `"archive"` | `"dir"` | `"external:<name>"`.
+    /// `None` never reaches registries.
+    pub fn key(&self) -> String {
+        match self {
+            InstallType::Appimage => "appimage".into(),
+            InstallType::Archive => "archive".into(),
+            InstallType::Dir => "dir".into(),
+            InstallType::None => "none".into(),
+            InstallType::External(n) => format!("external:{n}"),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InstallType {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "appimage" => Ok(InstallType::Appimage),
+            "archive" => Ok(InstallType::Archive),
+            "dir" => Ok(InstallType::Dir),
+            "none" => Ok(InstallType::None),
+            _ if s.starts_with("external:") => {
+                let name = &s["external:".len()..];
+                if name.is_empty() {
+                    Err(serde::de::Error::custom(
+                        "install.type \"external:\" requires a non-empty plugin name",
+                    ))
+                } else {
+                    Ok(InstallType::External(name.to_string()))
+                }
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "invalid install.type {other:?} (expected \"appimage\", \"archive\", \
+                 \"dir\", \"none\" or \"external:<name>\")"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -261,22 +307,91 @@ pub struct DesktopCfg {
     pub terminal: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct InstallCfg {
-    #[serde(rename = "type")]
     pub kind: InstallType,
     /// appimage only; default ~/Applications
-    #[serde(default)]
     pub target: Option<String>,
     /// archive: staged paths published into current/
-    #[serde(default)]
     pub bin_glob: Vec<String>,
     /// names symlinked into ~/.local/bin
-    #[serde(default)]
     pub link_bins: Vec<String>,
-    #[serde(default)]
     pub desktop: Option<DesktopCfg>,
+    /// external installers only: per-invocation timeout
+    pub timeout_secs: Option<u64>,
+    /// Remaining `[install]` keys; only populated when `kind` is
+    /// [`InstallType::External`] (passed through to the plugin as its config).
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl InstallCfg {
+    /// The remaining `[install]` keys as a table value (empty table for
+    /// builtins); handed to external installer plugins verbatim.
+    pub fn extra_table(&self) -> toml::Value {
+        let mut table = toml::map::Map::new();
+        for (k, v) in &self.extra {
+            table.insert(k.clone(), v.clone());
+        }
+        toml::Value::Table(table)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InstallCfg {
+    // Manual impl instead of `deny_unknown_fields`: builtin installers keep the
+    // strict behavior (unknown keys are errors), while `type = "external:<name>"`
+    // collects every unknown key into `extra` for pass-through to the plugin.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct InstallVisitor;
+        impl<'de> serde::de::Visitor<'de> for InstallVisitor {
+            type Value = InstallCfg;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an [install] table")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<InstallCfg, A::Error> {
+                let mut kind: Option<InstallType> = None;
+                let mut target = None;
+                let mut bin_glob = Vec::new();
+                let mut link_bins = Vec::new();
+                let mut desktop = None;
+                let mut timeout_secs = None;
+                let mut extra = BTreeMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "type" => kind = Some(map.next_value()?),
+                        "target" => target = map.next_value()?,
+                        "bin_glob" => bin_glob = map.next_value()?,
+                        "link_bins" => link_bins = map.next_value()?,
+                        "desktop" => desktop = map.next_value()?,
+                        "timeout_secs" => timeout_secs = map.next_value()?,
+                        other => {
+                            extra.insert(other.to_string(), map.next_value::<toml::Value>()?);
+                        }
+                    }
+                }
+                let kind = kind.ok_or_else(|| serde::de::Error::missing_field("type"))?;
+                if !extra.is_empty() && !matches!(kind, InstallType::External(_)) {
+                    return Err(serde::de::Error::custom(format!(
+                        "unknown [install] key(s) {}; extra [install] keys are only allowed \
+                         with type = \"external:<name>\"",
+                        extra.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )));
+                }
+                Ok(InstallCfg {
+                    kind,
+                    target,
+                    bin_glob,
+                    link_bins,
+                    desktop,
+                    timeout_secs,
+                    extra,
+                })
+            }
+        }
+        d.deserialize_map(InstallVisitor)
+    }
 }
 
 impl Default for InstallCfg {
@@ -287,6 +402,8 @@ impl Default for InstallCfg {
             bin_glob: Vec::new(),
             link_bins: Vec::new(),
             desktop: None,
+            timeout_secs: None,
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -746,5 +863,89 @@ mod tests {
         assert_eq!(expand_tilde("~/Applications"), h.join("Applications"));
         assert_eq!(expand_tilde("~"), h);
         assert_eq!(expand_tilde("/plain/path"), PathBuf::from("/plain/path"));
+    }
+
+    #[test]
+    fn external_install_type_parses() {
+        let t = r#"
+            id = "tool"
+            provider = "html-links"
+            url = "https://example.com/"
+            link_regex = 'href="([^"]+\.AppImage)"'
+            version_capture = "1"
+            [install]
+            type = "external:copytool"
+        "#;
+        let app = AppFile::parse(t, "apps.d/tool.toml").unwrap();
+        assert_eq!(app.install.kind, InstallType::External("copytool".into()));
+        assert_eq!(app.install.kind.key(), "external:copytool");
+    }
+
+    #[test]
+    fn install_extra_keys_rejected_for_builtins() {
+        let t = r#"
+            id = "tool"
+            provider = "github-releases"
+            repo = "a/b"
+            [install]
+            type = "appimage"
+            dest = "/opt/tool"
+        "#;
+        let err = AppFile::parse(t, "apps.d/tool.toml").unwrap_err().to_string();
+        assert!(err.contains("dest"), "{err}");
+        assert!(err.contains("only allowed"), "{err}");
+    }
+
+    #[test]
+    fn install_extra_keys_captured_for_external() {
+        let t = r#"
+            id = "tool"
+            provider = "html-links"
+            url = "https://example.com/"
+            link_regex = 'href="([^"]+\.AppImage)"'
+            version_capture = "1"
+            [install]
+            type = "external:copytool"
+            dest = "/opt/tool"
+            mode = 493
+        "#;
+        let app = AppFile::parse(t, "apps.d/tool.toml").unwrap();
+        assert_eq!(app.install.kind.key(), "external:copytool");
+        assert_eq!(app.install.extra.len(), 2);
+        assert_eq!(
+            app.install.extra["dest"].as_str(),
+            Some("/opt/tool")
+        );
+        assert_eq!(app.install.extra["mode"].as_integer(), Some(493));
+        // extra_table round-trips the same content.
+        match app.install.extra_table() {
+            toml::Value::Table(m) => assert_eq!(m.len(), 2),
+            other => panic!("expected table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_timeout_secs_parses() {
+        let t = r#"
+            id = "tool"
+            provider = "html-links"
+            url = "https://example.com/"
+            link_regex = 'href="([^"]+\.AppImage)"'
+            version_capture = "1"
+            [install]
+            type = "external:slow"
+            timeout_secs = 30
+        "#;
+        let app = AppFile::parse(t, "apps.d/tool.toml").unwrap();
+        assert_eq!(app.install.timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn empty_external_name_rejected() {
+        let t = GH_OK.replace("type = \"appimage\"", "type = \"external:\"");
+        let err = AppFile::parse(&t, "apps.d/freecad.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-empty"), "{err}");
     }
 }

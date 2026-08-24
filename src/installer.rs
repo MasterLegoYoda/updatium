@@ -1,12 +1,14 @@
 //! Installers: appimage / archive / dir publication with zip-slip and
 //! symlink-conflict guards. The ONLY module that touches untrusted archives.
 
-use crate::config::InstallCfg;
+use crate::config::{GlobalConfig, HomePaths, InstallCfg};
+use std::collections::HashMap;
+use std::sync::Arc;
 use crate::hash::collect_files;
 use anyhow::{Context, Result, bail};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-
+#[derive(Debug)]
 pub struct Publication {
     /// Paths published into current/ (relative to current/).
     pub published: Vec<String>,
@@ -394,6 +396,382 @@ pub fn install_appimage(download: &Path, filename: &str, target: &Path) -> Resul
     Ok(dest)
 }
 
+// ---------------------------------------------------------------------------
+// Installer plugins: builtin shapes + external executables (protocol v2)
+// ---------------------------------------------------------------------------
+
+/// Everything one installation needs: the app identity, the resolved `[install]`
+/// config, and whatever inputs the engine has prepared for the install shape
+/// (a digest-verified download, a source checkout, or nothing at all).
+pub struct InstallCtx<'a> {
+    pub app_id: &'a str,
+    pub version: &'a str,
+    pub cfg: &'a InstallCfg,
+    /// Remaining `[install]` keys as a table; empty table for builtins.
+    pub extra: &'a toml::Value,
+    /// Digest-verified download (asset apps).
+    pub download: Option<&'a Path>,
+    /// Asset filename.
+    pub filename: Option<&'a str>,
+    /// Source-build checkout.
+    pub checkout: Option<&'a Path>,
+    /// Source-build artifact globs (dir installer).
+    pub artifacts: &'a [String],
+    pub home: &'a HomePaths,
+}
+
+/// What an installer did. `publication: Some` hands the post-publish tail
+/// (link_bins, desktop, state) back to the engine; otherwise the engine runs
+/// the plain finish path with `exec_hint`.
+#[derive(Debug)]
+pub struct InstallOutcome {
+    /// Appended to UpdateReport.actions verbatim.
+    pub actions: Vec<String>,
+    /// Desktop Exec target; None → engine derives/omits.
+    pub exec_hint: Option<PathBuf>,
+    /// Some → engine runs publish_common tail.
+    pub publication: Option<Publication>,
+}
+
+#[async_trait::async_trait]
+pub trait Installer: Send + Sync {
+    /// Registry key.
+    fn key(&self) -> String;
+    /// External installers override → false: the engine then never assumes a
+    /// conventional executable layout when writing desktop entries.
+    fn core_desktop(&self) -> bool {
+        true
+    }
+    async fn install(&self, ctx: &InstallCtx) -> Result<InstallOutcome>;
+}
+
+struct AppimageInstaller;
+
+#[async_trait::async_trait]
+impl Installer for AppimageInstaller {
+    fn key(&self) -> String {
+        "appimage".into()
+    }
+    async fn install(&self, ctx: &InstallCtx) -> Result<InstallOutcome> {
+        let (download, filename) = match (ctx.download, ctx.filename) {
+            (Some(d), Some(f)) => (d, f),
+            _ => bail!("appimage install requires a downloaded asset"),
+        };
+        let target_dir = match &ctx.cfg.target {
+            Some(t) => crate::config::expand_tilde(t),
+            None => ctx.home.default_appimage_target(),
+        };
+        let dest = install_appimage(download, filename, &target_dir)?;
+        Ok(InstallOutcome {
+            actions: vec![format!("installed {}", dest.display())],
+            exec_hint: Some(dest),
+            publication: None,
+        })
+    }
+}
+
+struct ArchiveInstaller;
+
+#[async_trait::async_trait]
+impl Installer for ArchiveInstaller {
+    fn key(&self) -> String {
+        "archive".into()
+    }
+    async fn install(&self, ctx: &InstallCtx) -> Result<InstallOutcome> {
+        let Some(download) = ctx.download else {
+            bail!("archive install requires a downloaded asset");
+        };
+        let staging = ctx
+            .home
+            .installs()
+            .join(ctx.app_id)
+            .join(format!(".staging-{}", ctx.version));
+        let _ = std::fs::remove_dir_all(&staging);
+        extract_archive(download, &staging)?;
+        strip_single_root_dir(&staging)?;
+        let pubn = publish_from_staging(&staging, ctx.cfg, &ctx.home.install_current(ctx.app_id))?;
+        Ok(InstallOutcome {
+            actions: vec![format!("published {} artifacts", pubn.published.len())],
+            exec_hint: None,
+            publication: Some(pubn),
+        })
+    }
+}
+
+struct DirInstaller;
+
+#[async_trait::async_trait]
+impl Installer for DirInstaller {
+    fn key(&self) -> String {
+        "dir".into()
+    }
+    async fn install(&self, ctx: &InstallCtx) -> Result<InstallOutcome> {
+        let Some(checkout) = ctx.checkout else {
+            bail!("install.type dir requires a source-build checkout");
+        };
+        let pubn = publish_from_checkout(checkout, ctx.artifacts, &ctx.home.install_current(ctx.app_id))?;
+        Ok(InstallOutcome {
+            actions: vec![format!("published {} artifacts", pubn.published.len())],
+            exec_hint: None,
+            publication: Some(pubn),
+        })
+    }
+}
+
+/// An external installer plugin executable (protocol v2 `install` verb).
+#[derive(Debug)]
+pub struct ExternalInstaller {
+    pub basename: String,
+    pub path: PathBuf,
+}
+
+/// Wire format of an external plugin's `describe` response (v2 adds `verbs`).
+#[derive(serde::Deserialize)]
+struct InstallerDescribe {
+    protocol: i64,
+    id: String,
+    #[serde(default)]
+    verbs: Vec<String>,
+}
+
+/// Wire format of an external installer's `install` response.
+#[derive(serde::Deserialize)]
+struct PluginInstallOut {
+    #[serde(default)]
+    actions: Vec<String>,
+    exec: Option<String>,
+    /// Part of the wire contract (what the plugin claims it installed);
+    /// parsed for completeness, not consumed by the engine.
+    #[allow(dead_code)]
+    #[serde(default)]
+    installed: Vec<String>,
+}
+
+impl ExternalInstaller {
+    async fn invoke(&self, subcommand: &str, stdin_json: Option<&str>) -> Result<String> {
+        let argv = vec![self.path.to_string_lossy().into_owned(), subcommand.to_string()];
+        let out = crate::exec::run_with_stdin(
+            &argv,
+            None,
+            std::time::Duration::from_secs(60),
+            true,
+            stdin_json.map(|s| s.as_bytes()),
+            &[],
+        )
+        .await?;
+        anyhow::ensure!(
+            out.status,
+            "external installer '{}' {} failed:\n{}",
+            self.basename,
+            subcommand,
+            out.stderr_tail
+        );
+        Ok(out.stdout_tail)
+    }
+
+    /// Handshake: protocol >= 2, the `install` verb declared, id matches filename.
+    async fn handshake(&self) -> Result<()> {
+        let stdout = self.invoke("describe", None).await?;
+        let d: InstallerDescribe = serde_json::from_str(stdout.trim())
+            .with_context(|| format!("external installer {}: bad describe JSON", self.basename))?;
+        if d.protocol < 2 {
+            bail!(
+                "external installer '{}': unsupported protocol {} (this build speaks v2)",
+                self.basename,
+                d.protocol
+            );
+        }
+        if !d.verbs.iter().any(|v| v == "install") {
+            bail!(
+                "external installer '{}': does not declare the 'install' verb",
+                self.basename
+            );
+        }
+        if d.id != self.basename {
+            bail!(
+                "external installer '{}': describe id {:?} does not match filename",
+                self.basename,
+                d.id
+            );
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Installer for ExternalInstaller {
+    fn key(&self) -> String {
+        format!("external:{}", self.basename)
+    }
+
+    fn core_desktop(&self) -> bool {
+        false
+    }
+
+    async fn install(&self, ctx: &InstallCtx) -> Result<InstallOutcome> {
+        self.handshake().await?;
+        let home_root = home_root_path(ctx.home);
+        let payload = serde_json::json!({
+            "app": ctx.app_id,
+            "version": ctx.version,
+            "config": serde_json::to_value(ctx.extra)?,
+            "paths": {
+                "download": ctx.download.map(|p| p.to_string_lossy().into_owned()),
+                "checkout": ctx.checkout.map(|p| p.to_string_lossy().into_owned()),
+                "home": home_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            },
+        });
+        let payload_str = payload.to_string();
+        // UPDATIUM_HOME is only set when the data root was relocated; under XDG
+        // there is no single root to hand out.
+        let home_str = home_root.map(|p| p.to_string_lossy().into_owned());
+        let mut env_pairs: Vec<(&str, &str)> = Vec::new();
+        if let Some(hs) = &home_str {
+            env_pairs.push(("UPDATIUM_HOME", hs));
+        }
+        let argv = vec![
+            self.path.to_string_lossy().into_owned(),
+            "install".to_string(),
+        ];
+        let timeout = std::time::Duration::from_secs(ctx.cfg.timeout_secs.unwrap_or(600));
+        let out = crate::exec::run_with_stdin(
+            &argv,
+            None,
+            timeout,
+            true,
+            Some(payload_str.as_bytes()),
+            &env_pairs,
+        )
+        .await?;
+        anyhow::ensure!(
+            out.status,
+            "external installer '{}' install failed:\n{}",
+            self.basename,
+            out.stderr_tail
+        );
+        let parsed: PluginInstallOut = serde_json::from_str(out.stdout_tail.trim())
+            .with_context(|| format!("external installer {}: bad install JSON", self.basename))?;
+        Ok(InstallOutcome {
+            actions: parsed.actions,
+            exec_hint: parsed.exec.map(PathBuf::from),
+            publication: None,
+        })
+    }
+}
+
+/// The unified data root when relocated under `UPDATIUM_HOME`/`--home`;
+/// otherwise None (XDG spreads dirs across several roots).
+fn home_root_path(home: &HomePaths) -> Option<&Path> {
+    if home.relocated {
+        home.config_dir.parent()
+    } else {
+        None
+    }
+}
+
+/// Build the installer registry: builtins plus discovered external plugins
+/// (`updatium-installer-*` on PATH and executables under `<config>/installers.d/`,
+/// registered as `external:<basename>`).
+pub fn registry(global: &GlobalConfig) -> HashMap<String, Arc<dyn Installer>> {
+    let mut map: HashMap<String, Arc<dyn Installer>> = HashMap::new();
+    map.insert("appimage".into(), Arc::new(AppimageInstaller));
+    map.insert("archive".into(), Arc::new(ArchiveInstaller));
+    map.insert("dir".into(), Arc::new(DirInstaller));
+    for ext in discover_external(global) {
+        let key = format!("external:{}", ext.basename);
+        map.insert(key, Arc::new(ext));
+    }
+    map
+}
+
+/// Resolve a registry key against the installer registry, listing valid keys on miss.
+pub fn lookup(reg: &HashMap<String, Arc<dyn Installer>>, key: &str) -> Result<Arc<dyn Installer>> {
+    reg.get(key).map(Arc::clone).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown installer '{key}' (valid: {})",
+            sorted_keys(reg).join(", ")
+        )
+    })
+}
+
+fn sorted_keys(reg: &HashMap<String, Arc<dyn Installer>>) -> Vec<String> {
+    let mut v: Vec<_> = reg.keys().cloned().collect();
+    v.sort();
+    v
+}
+
+/// Find external installer executables: PATH entries named
+/// `updatium-installer-*` plus regular executable files directly inside
+/// `<config>/installers.d/` (registered under their exact file name).
+pub fn discover_external(global: &GlobalConfig) -> Vec<ExternalInstaller> {
+    let mut found: HashMap<String, PathBuf> = HashMap::new();
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if let Some(base) = name.strip_prefix("updatium-installer-") {
+                        if crate::provider::is_executable_file(&e.path()) {
+                            found.entry(base.to_string()).or_insert_with(|| e.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let idir = global.home.installers_d();
+    if let Ok(entries) = std::fs::read_dir(&idir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if crate::provider::is_executable_file(&e.path()) {
+                found.insert(name, e.path());
+            }
+        }
+    }
+
+    out_sort(found)
+}
+
+fn out_sort(found: HashMap<String, PathBuf>) -> Vec<ExternalInstaller> {
+    let mut out: Vec<ExternalInstaller> = found
+        .into_iter()
+        .map(|(basename, path)| ExternalInstaller { basename, path })
+        .collect();
+    out.sort_by(|a, b| a.basename.cmp(&b.basename));
+    out
+}
+
+/// One row of [`describe_registry`].
+pub struct PluginInfo {
+    pub key: String,
+    /// `"builtin"` or `"external"`.
+    pub kind: &'static str,
+    /// Executable path for externals; None for builtins.
+    pub path: Option<PathBuf>,
+}
+
+/// Registry contents for `updatium plugins`: builtins first, externals after.
+pub fn describe_registry(global: &GlobalConfig) -> Vec<PluginInfo> {
+    let mut out = vec![
+        PluginInfo { key: "appimage".into(), kind: "builtin", path: None },
+        PluginInfo { key: "archive".into(), kind: "builtin", path: None },
+        PluginInfo { key: "dir".into(), kind: "builtin", path: None },
+    ];
+    let mut ext: Vec<_> = discover_external(global)
+        .into_iter()
+        .map(|e| PluginInfo {
+            key: format!("external:{}", e.basename),
+            kind: "external",
+            path: Some(e.path),
+        })
+        .collect();
+    ext.sort_by(|a, b| a.key.cmp(&b.key));
+    out.extend(ext);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +917,7 @@ mod tests {
             bin_glob: vec!["bin/*".into()],
             link_bins: vec![],
             desktop: None,
+            ..Default::default()
         };
         let pubn = publish_from_staging(&staging, &install, &current).unwrap();
         assert_eq!(pubn.published, vec!["bin/cli"]);
@@ -573,6 +952,7 @@ mod tests {
             bin_glob: vec!["**".into()],
             link_bins: vec!["mytool".into()],
             desktop: None,
+            ..Default::default()
         };
         // Build the staging dir for this test:
         let staging = dir.path().join("stage_prepared");
@@ -620,6 +1000,7 @@ mod tests {
             bin_glob: vec!["**".into()],
             link_bins: vec!["mytool".into()],
             desktop: None,
+            ..Default::default()
         };
         let pubn = publish_from_staging(&staging, &install, &current).unwrap();
         let pubn = link_bins(
@@ -686,5 +1067,162 @@ mod tests {
         );
         // No tmp leftovers.
         assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod plugin_tests {
+    use super::*;
+
+    fn test_global(dir: &Path) -> GlobalConfig {
+        let mut g = GlobalConfig::load(Path::new("/nonexistent/config.toml")).unwrap();
+        g.home = HomePaths::resolve(Some(dir)).unwrap();
+        g
+    }
+
+    /// Write a stub installer plugin that answers `describe` and rejects everything else.
+    fn write_plugin(dir: &Path, name: &str, describe_json: &str) -> PathBuf {
+        let p = dir.join(name);
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  describe) printf '%s\\n' '{}' ;;\n  *) echo \"unexpected $1\" >&2; exit 9 ;;\nesac\n",
+            describe_json
+        );
+        std::fs::write(&p, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    fn empty_table() -> toml::Value {
+        toml::Value::Table(toml::map::Map::new())
+    }
+
+    #[test]
+    fn registry_lookup_hit_and_miss_lists_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = test_global(dir.path());
+        let reg = registry(&g);
+        for key in ["appimage", "archive", "dir"] {
+            assert_eq!(lookup(&reg, key).unwrap().key(), key);
+        }
+        let err = match lookup(&reg, "nope") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("'nope' must not resolve"),
+        };
+        assert!(err.contains("unknown installer 'nope'"), "{err}");
+        assert!(err.contains("appimage") && err.contains("archive") && err.contains("dir"), "{err}");
+    }
+
+    #[test]
+    fn discovery_finds_installers_d_executable_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = test_global(dir.path());
+        let idir = g.home.installers_d();
+        std::fs::create_dir_all(&idir).unwrap();
+        write_plugin(&idir, "mytool", r#"{"protocol":2,"id":"mytool","verbs":["install"]}"#);
+        std::fs::write(idir.join("notexec.txt"), "plain data").unwrap();
+        // A directory must never register even if named plausibly.
+        std::fs::create_dir_all(idir.join("subdir-plugin")).unwrap();
+        let found = discover_external(&g);
+        assert!(
+            found.iter().any(|e| e.basename == "mytool"),
+            "executable plugin discovered: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|e| e.basename == "notexec.txt"),
+            "non-executable ignored: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|e| e.basename == "subdir-plugin"),
+            "directories ignored: {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dir_installer_bails_without_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = test_global(dir.path());
+        let cfg = InstallCfg {
+            kind: crate::config::InstallType::Dir,
+            ..Default::default()
+        };
+        let extra = empty_table();
+        let ctx = InstallCtx {
+            app_id: "demo",
+            version: "1.0.0",
+            cfg: &cfg,
+            extra: &extra,
+            download: None,
+            filename: None,
+            checkout: None,
+            artifacts: &[],
+            home: &g.home,
+        };
+        let err = DirInstaller.install(&ctx).await.unwrap_err().to_string();
+        assert!(err.contains("requires a source-build checkout"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_handshake_rejects_protocol_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_plugin(dir.path(), "stub", r#"{"protocol":1,"id":"stub"}"#);
+        let ext = ExternalInstaller {
+            basename: "stub".into(),
+            path,
+        };
+        let cfg = InstallCfg {
+            kind: crate::config::InstallType::External("stub".into()),
+            ..Default::default()
+        };
+        let extra = empty_table();
+        let mut g = GlobalConfig::load(Path::new("/nonexistent/config.toml")).unwrap();
+        g.home = HomePaths::resolve(Some(dir.path())).unwrap();
+        let ctx = InstallCtx {
+            app_id: "demo",
+            version: "1.0.0",
+            cfg: &cfg,
+            extra: &extra,
+            download: None,
+            filename: None,
+            checkout: None,
+            artifacts: &[],
+            home: &g.home,
+        };
+        let err = ext.install(&ctx).await.unwrap_err().to_string();
+        assert!(err.contains("unsupported protocol 1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_handshake_rejects_missing_install_verb() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_plugin(
+            dir.path(),
+            "stub",
+            r#"{"protocol":2,"id":"stub","verbs":["check"]}"#,
+        );
+        let ext = ExternalInstaller {
+            basename: "stub".into(),
+            path,
+        };
+        let cfg = InstallCfg {
+            kind: crate::config::InstallType::External("stub".into()),
+            ..Default::default()
+        };
+        let extra = empty_table();
+        let mut g = GlobalConfig::load(Path::new("/nonexistent/config.toml")).unwrap();
+        g.home = HomePaths::resolve(Some(dir.path())).unwrap();
+        let ctx = InstallCtx {
+            app_id: "demo",
+            version: "1.0.0",
+            cfg: &cfg,
+            extra: &extra,
+            download: None,
+            filename: None,
+            checkout: None,
+            artifacts: &[],
+            home: &g.home,
+        };
+        let err = ext.install(&ctx).await.unwrap_err().to_string();
+        assert!(err.contains("'install' verb"), "{err}");
     }
 }

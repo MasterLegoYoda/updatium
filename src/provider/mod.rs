@@ -150,6 +150,11 @@ struct PluginCheckOut {
 struct PluginDescribe {
     protocol: i64,
     id: String,
+    /// v2 plugins declare the verbs they implement ("check"). Absent in v1;
+    /// install-capable plugins are a separate executable class.
+    #[serde(default)]
+    #[allow(dead_code)]
+    verbs: Vec<String>,
 }
 
 impl ExternalProvider {
@@ -165,6 +170,7 @@ impl ExternalProvider {
             std::time::Duration::from_secs(60),
             true,
             stdin_json.map(|s| s.as_bytes()),
+            &[],
         )
         .await?;
         anyhow::ensure!(
@@ -181,9 +187,10 @@ impl ExternalProvider {
         let stdout = self.invoke("describe", None).await?;
         let d: PluginDescribe = serde_json::from_str(stdout.trim())
             .with_context(|| format!("external provider {}: bad describe JSON", self.basename))?;
-        if d.protocol != 1 {
+        if d.protocol != 1 && d.protocol != 2 {
             bail!(
-                "external provider '{}': unsupported protocol {} (this build speaks v1)",
+                "external provider '{}': unsupported protocol {} (this build speaks v2; v1 \
+                 check-only accepted)",
                 self.basename,
                 d.protocol
             );
@@ -256,7 +263,7 @@ pub fn discover_external(global: &GlobalConfig) -> Vec<ExternalProvider> {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             if is_executable_file(&e.path()) {
-                // providers.d entries register under their full filename stem.
+                // providers.d entries register under their exact file name.
                 found.insert(name, PathBufOrdered(e.path()));
             }
         }
@@ -270,7 +277,39 @@ pub fn discover_external(global: &GlobalConfig) -> Vec<ExternalProvider> {
     out
 }
 
-fn is_executable_file(p: &std::path::Path) -> bool {
+/// One row of [`describe_registry`].
+pub struct PluginInfo {
+    pub key: String,
+    /// `"builtin"` or `"external"`.
+    pub kind: &'static str,
+    /// Executable path for externals; None for builtins.
+    pub path: Option<std::path::PathBuf>,
+}
+
+/// Registry contents for `updatium plugins`: builtins first, externals after.
+pub fn describe_registry(global: &GlobalConfig) -> Vec<PluginInfo> {
+    let mut out: Vec<PluginInfo> = BUILTIN_PROVIDERS
+        .iter()
+        .map(|k| PluginInfo {
+            key: (*k).to_string(),
+            kind: "builtin",
+            path: None,
+        })
+        .collect();
+    let mut ext: Vec<_> = discover_external(global)
+        .into_iter()
+        .map(|e| PluginInfo {
+            key: format!("external:{}", e.basename),
+            kind: "external",
+            path: Some(e.path),
+        })
+        .collect();
+    ext.sort_by(|a, b| a.key.cmp(&b.key));
+    out.extend(ext);
+    out
+}
+
+pub(crate) fn is_executable_file(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(p) {
         Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),

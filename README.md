@@ -169,6 +169,7 @@ updatium check [ids...|--all] [--json]     # default: all enabled
 updatium update (<id>|--all) [--yes] [--dry-run] [--force]
 updatium approve <id> [--show-diff] [--yes]
 updatium history [<id>] [--limit 50] [--json]
+updatium plugins [--json]
 updatium desktop <id> [--remove]
 updatium tui [--print-frame]
 updatium completions <shell>
@@ -203,19 +204,170 @@ TUI keys: `r` refresh · `u` update selected · `a` approve selected ·
 * **Secrets** — GitHub tokens come from `token_cmd` stdout or env at runtime;
   never persisted.
 
-## External provider protocol (v1)
+## External provider protocol (v2)
 
 Any executable named `updatium-provider-*` on `PATH`, or any executable directly
 inside `<config>/providers.d/`, becomes available as
 `provider = "external:<name>"`.
 
-1. `describe` → stdout JSON `{"protocol":1,"id":"<basename>"}`.
+1. `describe` → stdout JSON `{"protocol":2,"id":"<basename>","verbs":["check"]}`.
+   Protocol `1` (no `verbs` field) is still accepted, check-only.
 2. `check` — receives the app's remaining config as JSON on **stdin**, replies
    with `{"releases":[...]}` where each release matches
    `{version, published_at, assets:[{name,url,size,digest}]}` (snake_case).
 
 Nonzero exit fails the app's check with the stderr tail; timeout is 60 s.
 See `examples/provider-example.sh` for a working bash+python implementation.
+
+External-provider apps are no longer limited to tracking: with an `[install]`
+section they flow through the same download → digest-verify → install pipeline
+as builtin providers.
+
+## Installer plugins
+
+Installation itself is pluggable. Builtins cover the three native shapes
+(`appimage`, `archive`, `dir`); anything else is delegated to an external
+installer plugin.
+
+**Discovery** — executables named `updatium-installer-*` on `PATH`, plus any
+executable directly inside `<config>/installers.d/` (registered under its exact
+file name). Reference them in an app file with:
+
+```toml
+[install]
+type = "external:copytool"
+timeout_secs = 120        # optional; default 600 s per install invocation
+dest = "/opt/tool"        # any extra key → passed to the plugin verbatim
+```
+
+Extra `[install]` keys are only allowed with `type = "external:…"`, and are
+handed to the plugin as its `config` object. Builtins keep strict
+unknown-key rejection.
+
+**Contract**
+
+1. `describe` → stdout JSON
+   `{"protocol":2,"id":"<basename>","verbs":["install"]}`. The handshake
+   requires protocol ≥ 2 **and** the `install` verb **and** `id` matching the
+   filename.
+2. `install` — receives JSON on **stdin**:
+
+   ```json
+   {
+     "app": "<id>",
+     "version": "<version>",
+     "config": { "...": "remaining [install] keys" },
+     "paths": {
+       "download": "/abs/path/or/null",
+       "checkout": "/abs/path/or/null",
+       "home": "<UPDATIUM_HOME or null>"
+     }
+   }
+   ```
+
+   It replies on stdout with:
+
+   ```json
+   {"actions":["copied by copytool"],"exec":"/abs/exec-or-null","installed":["..."]}
+   ```
+
+   `actions` appear verbatim in the update report and history; `exec` becomes
+   the desktop-entry target when `[install.desktop]` is configured (if null,
+   a warning is recorded instead of a desktop entry).
+
+The plugin runs with `UPDATIUM_HOME` set in its environment when updatium's
+data root was relocated (`--home`/`UPDATIUM_HOME`); under default XDG layout no
+single root exists and it stays unset.
+
+**Trust model** — installer plugins execute arbitrary code with full access to
+updatium's home directories, exactly like provider plugins: dropping an
+executable into a discovery location IS the opt-in. Nothing is sandboxed in
+this iteration; only install plugins you have reviewed.
+
+Run `updatium plugins` to list every registered provider and installer plugin
+(builtin and external) with its source path.
+
+## Writing and loading plugins
+
+### Loading rules
+
+Plugins are plain executables — any language works as long as it can read
+stdin, print JSON to stdout, and exit nonzero on failure. Both plugin kinds are
+loaded the same way:
+
+* **Scanned fresh at every updatium invocation.** No cache, no restart, no
+  registration step: drop a file in place and run `updatium plugins`.
+* **Two locations per kind**, checked in this order:
+
+  | Kind | On `PATH` | Config dir |
+  |---|---|---|
+  | Provider | `updatium-provider-<name>` | `<config>/providers.d/<file>` |
+  | Installer | `updatium-installer-<name>` | `<config>/installers.d/<file>` |
+
+* A file qualifies only if it is a regular file directly inside the directory
+  (no recursion) with at least one execute bit set.
+* Registry keys: a PATH entry registers under what follows the prefix
+  (`updatium-installer-copytool` → `external:copytool`); a config-dir file
+  registers under its exact file name, extension included
+  (`copy.sh` → `external:copy.sh`). Prefer extension-less names so the name
+  stays simple — for providers the describe `id` must match it exactly.
+* A config-dir file overrides a same-named PATH entry; externals live under
+  the `external:` prefix and can never shadow a builtin.
+* `--home` / `UPDATIUM_HOME` relocates `providers.d/`/`installers.d/` too, so
+  you can develop plugins against an isolated tree without touching your real
+  one.
+
+### Walkthrough: minimal installer plugin
+
+```bash
+mkdir -p ~/.config/updatium/installers.d
+cat > ~/.config/updatium/installers.d/copytool <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  describe) echo '{"protocol":2,"id":"copytool","verbs":["install"]}' ;;
+  install)
+    cfg=$(cat)
+    download=$(printf '%s' "$cfg" | python3 -c 'import json,sys; print(json.load(sys.stdin)["paths"]["download"])')
+    dest=$(printf '%s' "$cfg" | python3 -c 'import json,sys; print(json.load(sys.stdin)["config"]["dest"])')
+    cp "$download" "$dest"
+    echo '{"actions":["copied by copytool"],"exec":null,"installed":[]}'
+    ;;
+  *) echo "unknown verb $1" >&2; exit 9 ;;
+esac
+EOF
+chmod +x ~/.config/updatium/installers.d/copytool
+```
+
+Confirm registration, then point an app at it:
+
+```console
+$ updatium plugins        # must list `installer external:copytool`
+```
+
+```toml
+# apps.d/myapp.toml (provider side can be any provider, builtin or external)
+[install]
+type = "external:copytool"
+dest = "/opt/myapp/current"   # arbitrary keys become the plugin's `config`
+```
+
+A working end-to-end version of both halves lives in
+`tests/installer_plugin.rs`; a provider plugin example is
+`examples/provider-example.sh`.
+
+### Debugging
+
+* Registration problems → `updatium plugins`: missing row means wrong location,
+  missing exec bit, nested file, or PATH-prefix mismatch.
+* Handshake failures surface verbatim in check/update errors: unsupported
+  protocol, undeclared verb, or describe `id` not matching the file name.
+* Nonzero exits fail with the plugin's stderr tail attached — log there.
+* Timeouts: 60 s hard limit for every `describe`/`check` call; installer
+  `install` calls get `timeout_secs` (default 600 s). Long builds belong in
+  source-build apps, not installer plugins.
+* Every install attempt lands in `updatium history <id>` (`install_ok`,
+  `verify_failed`, …), so a failed plugin run leaves a trace even when its own
+  output is unhelpful.
 
 ## Development
 
