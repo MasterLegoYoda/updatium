@@ -180,4 +180,30 @@ echo "--- tui frame ---"
 echo "$FRAME"
 echo "----------------"
 
+# --- 8. yaml/json app files and scaffolds ------------------------------------
+cat > "$UPDATIUM_HOME/config/apps.d/ydemo.yaml" <<EOF
+id: ydemo
+provider: html-links
+url: "$BASE/site/"
+allow_insecure_http: true
+link_regex: 'href="(?P<href>[^"]+\\.AppImage)"'
+version_capture: '(?P<version>\\d+\\.\\d+(\\.\\d+)?)'
+digest_suffix: ".sha256"
+digest_policy: prefer
+
+install:
+  type: none
+EOF
+# Loader picks up a .yaml app alongside the .toml ones.
+YCHECK=$("$BIN" check ydemo --json)
+echo "$YCHECK" | grep -q '"app": "ydemo"' || { echo "FAIL yaml app check:"; echo "$YCHECK"; exit 1; }
+
+"$BIN" add yadd --provider github-releases --format yaml >/dev/null
+test -f "$UPDATIUM_HOME/config/apps.d/yadd.yaml"
+grep -q '^provider: github-releases' "$UPDATIUM_HOME/config/apps.d/yadd.yaml"
+"$BIN" add yj --provider command --format json >/dev/null
+test -f "$UPDATIUM_HOME/config/apps.d/yj.json"
+python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+    "$UPDATIUM_HOME/config/apps.d/yj.json" || { echo "FAIL invalid json scaffold"; exit 1; }
+
 echo "E2E OK"

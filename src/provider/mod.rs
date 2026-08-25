@@ -227,8 +227,7 @@ impl ExternalProvider {
             crate::config::SourceKind::External { raw, .. } => raw,
             _ => bail!("provider mismatch: external got another app kind"),
         };
-        let cfg_json = serde_json::to_value(raw)?;
-        let stdout = self.invoke("check", Some(&cfg_json.to_string())).await?;
+        let stdout = self.invoke("check", Some(&raw.to_string())).await?;
         let parsed: PluginCheckOut = serde_json::from_str(stdout.trim())
             .with_context(|| format!("external provider {}: bad check JSON", self.basename))?;
         Ok(parsed.releases)

@@ -90,7 +90,7 @@ updatium update llamacpp
 
 | Purpose | Default | Override |
 |---|---|---|
-| Config (`config.toml`, `apps.d/`, `providers.d/`) | `$XDG_CONFIG_HOME/updatium/` | |
+| Config (`config.{toml,yaml,yml,json}`, `apps.d/`, `providers.d/`) | `$XDG_CONFIG_HOME/updatium/` | |
 | State (`state.db`, `installs/`, `src/`, `script-snapshots/`) | `$XDG_DATA_HOME/updatium/` | |
 | Cache (`downloads/`) | `$XDG_CACHE_HOME/updatium/downloads/` | |
 | Desktop entries | `~/.local/share/applications/` | |
@@ -99,6 +99,9 @@ Set `UPDATIUM_HOME=<dir>` or pass `--home <dir>` to relocate everything under
 one root (used by tests and CI; nothing outside it is touched).
 
 ## Global `config.toml`
+
+The global config file may be `config.toml`, `config.yaml`/`config.yml`, or
+`config.json`; if several exist the first in that order wins.
 
 ```toml
 max_parallel_checks = 4          # concurrent provider checks (default 4)
@@ -113,7 +116,9 @@ token_cmd = []                   # argv whose stdout line 1 is a PAT;
 
 ## App files `apps.d/<id>.toml`
 
-Filename stem must equal `id`. Unknown keys are startup errors.
+Filename stem must equal `id` regardless of extension; app files may be
+`.toml`, `.yaml`/`.yml`, or `.json`, freely mixed. Unknown keys are startup
+errors.
 
 Common keys: `id`, `provider`, `enabled` (default true),
 `digest_policy` = `required | prefer | off` (default `prefer`),
@@ -163,7 +168,7 @@ releases, `[build]`: `steps`, `tracked_files`, `artifacts`, `timeout_secs`
 ## CLI
 
 ```
-updatium add <id> --provider <p> [--edit]
+updatium add <id> --provider <p> [--edit] [--format toml|yaml|json]
 updatium list [--json]
 updatium check [ids...|--all] [--json]     # default: all enabled
 updatium update (<id>|--all) [--yes] [--dry-run] [--force]

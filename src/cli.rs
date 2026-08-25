@@ -38,9 +38,27 @@ pub enum Shell {
     Elvish,
 }
 
+/// Output format of the `add` scaffold; mirrors config::ConfigFormat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ScaffoldFormat {
+    Toml,
+    Yaml,
+    Json,
+}
+
+impl ScaffoldFormat {
+    fn config_format(self) -> crate::config::ConfigFormat {
+        match self {
+            ScaffoldFormat::Toml => crate::config::ConfigFormat::Toml,
+            ScaffoldFormat::Yaml => crate::config::ConfigFormat::Yaml,
+            ScaffoldFormat::Json => crate::config::ConfigFormat::Json,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Cmd {
-    /// Write a scaffolded apps.d/<id>.toml from the provider template
+    /// Write a scaffolded apps.d/<id>.<fmt> from the provider template
     Add {
         id: String,
         #[arg(long, short)]
@@ -48,6 +66,9 @@ pub enum Cmd {
         /// Open $EDITOR on the scaffold afterwards
         #[arg(long, short)]
         edit: bool,
+        /// File format of the generated app file
+        #[arg(long, value_enum, default_value_t = ScaffoldFormat::Toml)]
+        format: ScaffoldFormat,
     },
     /// List configured apps and their recorded state
     List {
@@ -307,7 +328,7 @@ type = "none"
     ),
 ];
 
-fn cmd_add(cli: &Cli, id: &str, provider: &str, edit: bool) -> Result<()> {
+fn cmd_add(cli: &Cli, id: &str, provider: &str, edit: bool, fmt: ScaffoldFormat) -> Result<()> {
     if !provider.starts_with("external:") {
         anyhow::ensure!(
             PROVIDER_TEMPLATES.iter().any(|(p, _)| *p == provider),
@@ -324,7 +345,8 @@ fn cmd_add(cli: &Cli, id: &str, provider: &str, edit: bool) -> Result<()> {
     );
     let engine = Engine::new(cli.home.as_deref())?;
     let dir = engine.home_paths().apps_d();
-    let path = dir.join(format!("{id}.toml"));
+    let cfg_fmt = fmt.config_format();
+    let path = dir.join(format!("{id}.{}", cfg_fmt.extension()));
     if path.exists() {
         bail!("refusing to overwrite {}", path.display());
     }
@@ -340,6 +362,15 @@ provider = "{provider}"
 type = "none"
 "#
         )
+    };
+    // Templates are TOML text (single source of truth). Toml keeps the raw
+    // template so its comments survive; other formats transcode through the
+    // canonical IR.
+    let body = if fmt == ScaffoldFormat::Toml {
+        body
+    } else {
+        let ir = crate::config::ConfigFormat::Toml.parse(&body)?;
+        cfg_fmt.serialize(&ir)?
     };
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     println!("wrote {}", path.display());
@@ -364,8 +395,13 @@ pub fn run() -> Result<()> {
 
 fn dispatch(cli: &Cli) -> Result<i32> {
     match &cli.command {
-        Cmd::Add { id, provider, edit } => {
-            cmd_add(cli, id, provider, *edit)?;
+        Cmd::Add {
+            id,
+            provider,
+            edit,
+            format,
+        } => {
+            cmd_add(cli, id, provider, *edit, *format)?;
             Ok(0)
         }
         Cmd::List { json } => {

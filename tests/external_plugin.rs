@@ -39,7 +39,7 @@ async fn stub_provider_round_trips_config() {
     let reg = registry(&g);
     let prov = registry_lookup_ok(&reg, "external:stub");
 
-    let raw: toml::Value = toml::from_str(r#"version = "9.9.9""#).unwrap();
+    let raw = serde_json::json!({ "version": "9.9.9" });
     let src = updatium::config::AppSource {
         allow_insecure_http: false,
         kind: SourceKind::External {
@@ -75,7 +75,7 @@ async fn wrong_protocol_version_is_rejected() {
         allow_insecure_http: false,
         kind: SourceKind::External {
             id: "future".into(),
-            raw: toml::Value::Table(Default::default()),
+            raw: serde_json::Value::Object(Default::default()),
         },
     };
     let err = prov
@@ -102,7 +102,7 @@ async fn nonzero_exit_surfaces_stderr() {
         allow_insecure_http: false,
         kind: SourceKind::External {
             id: "broken".into(),
-            raw: toml::Value::Table(Default::default()),
+            raw: serde_json::Value::Object(Default::default()),
         },
     };
     let err = prov

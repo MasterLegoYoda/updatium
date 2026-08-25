@@ -1,12 +1,16 @@
-//! Configuration: global `config.toml`, per-app `apps.d/<id>.toml`, home-path
-//! resolution.
+//! Configuration: global `config.{toml,yaml,yml,json}`, per-app
+//! `apps.d/<id>.{toml,yaml,yml,json}`, home-path resolution.
 //!
 //! Load-bearing: app files are parsed in TWO passes because serde's
-//! `deny_unknown_fields` does not work on internally-tagged enums. Pass 1 parses
-//! the file into a `toml::Value` and pops `"provider"`; pass 2 deserializes the
-//! remainder into the concrete per-provider struct which DOES declare
+//! `deny_unknown_fields` does not work on internally-tagged enums. Pass 1
+//! parses the file via [`ConfigFormat`] into a canonical `serde_json::Value`
+//! table and pops `"provider"`; pass 2 deserializes the remainder into the
+//! concrete per-provider struct which DOES declare
 //! `#[serde(deny_unknown_fields)]`. Typo'd keys are therefore startup errors.
 
+pub mod format;
+
+pub use self::format::ConfigFormat;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -97,6 +101,15 @@ impl HomePaths {
     }
 
     pub fn config_file(&self) -> PathBuf {
+        // Fixed precedence; an existing config.toml always keeps winning so
+        // existing setups are unaffected.
+        const CANDIDATES: [&str; 4] = ["config.toml", "config.yaml", "config.yml", "config.json"];
+        for name in CANDIDATES {
+            let p = self.config_dir.join(name);
+            if p.exists() {
+                return p;
+            }
+        }
         self.config_dir.join("config.toml")
     }
     pub fn apps_d(&self) -> PathBuf {
@@ -207,7 +220,7 @@ fn d_max_download_mb() -> u64 {
 
 impl Default for GlobalConfig {
     fn default() -> Self {
-        toml::from_str("").expect("static defaults parse")
+        serde_json::from_str("{}").expect("static defaults parse")
     }
 }
 
@@ -221,7 +234,10 @@ impl GlobalConfig {
             }
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let ir = ConfigFormat::from_path(path)?
+            .parse(&text)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        serde_json::from_value(ir).with_context(|| format!("parsing {}", path.display()))
     }
 }
 
@@ -321,18 +337,16 @@ pub struct InstallCfg {
     pub timeout_secs: Option<u64>,
     /// Remaining `[install]` keys; only populated when `kind` is
     /// [`InstallType::External`] (passed through to the plugin as its config).
-    pub extra: BTreeMap<String, toml::Value>,
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl InstallCfg {
     /// The remaining `[install]` keys as a table value (empty table for
     /// builtins); handed to external installer plugins verbatim.
-    pub fn extra_table(&self) -> toml::Value {
-        let mut table = toml::map::Map::new();
-        for (k, v) in &self.extra {
-            table.insert(k.clone(), v.clone());
-        }
-        toml::Value::Table(table)
+    pub fn extra_table(&self) -> serde_json::Value {
+        serde_json::Value::Object(
+            self.extra.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        )
     }
 }
 
@@ -367,7 +381,7 @@ impl<'de> serde::Deserialize<'de> for InstallCfg {
                         "desktop" => desktop = map.next_value()?,
                         "timeout_secs" => timeout_secs = map.next_value()?,
                         other => {
-                            extra.insert(other.to_string(), map.next_value::<toml::Value>()?);
+                            extra.insert(other.to_string(), map.next_value::<serde_json::Value>()?);
                         }
                     }
                 }
@@ -514,7 +528,7 @@ pub enum SourceKind {
     /// External plugin; raw remaining config passed as JSON on stdin.
     External {
         id: String,
-        raw: toml::Value,
+        raw: serde_json::Value,
     },
 }
 
@@ -549,24 +563,32 @@ impl AppFile {
         }
     }
 
-    /// Two-pass parse of one app definition file.
-    /// `path` is used only for error messages; the caller enforces filename/id.
+    /// Two-pass parse of one app definition file. The format is inferred from
+    /// the extension of `path_for_errors`, which is otherwise used only for
+    /// error messages; the caller enforces filename/id.
     pub fn parse(text: &str, path_for_errors: &str) -> Result<AppFile> {
-        let value: toml::Value =
-            toml::from_str(text).with_context(|| format!("parsing {path_for_errors}"))?;
+        let value = ConfigFormat::from_path(Path::new(path_for_errors))
+            .and_then(|fmt| fmt.parse(text))
+            .with_context(|| format!("parsing {path_for_errors}"))?;
+        Self::parse_value(value, path_for_errors)
+    }
+
+    /// Two-pass parse from the canonical IR (`serde_json::Value`); exposed so
+    /// app definitions can be built without going through a file format.
+    pub fn parse_value(value: serde_json::Value, path_for_errors: &str) -> Result<AppFile> {
         let mut table = value
-            .as_table()
+            .as_object()
             .cloned()
-            .with_context(|| format!("{path_for_errors}: not a TOML table"))?;
+            .with_context(|| format!("{path_for_errors}: not a table"))?;
 
         let provider = match table.remove("provider") {
-            Some(toml::Value::String(s)) => s,
+            Some(serde_json::Value::String(s)) => s,
             Some(_) => bail!("{path_for_errors}: key 'provider' must be a string"),
             None => bail!("{path_for_errors}: missing required key 'provider'"),
         };
 
         let id = match table.remove("id") {
-            Some(toml::Value::String(s)) => s,
+            Some(serde_json::Value::String(s)) => s,
             Some(_) => bail!("{path_for_errors}: key 'id' must be a string"),
             None => bail!("{path_for_errors}: missing required key 'id'"),
         };
@@ -581,7 +603,7 @@ impl AppFile {
 
         // Pass 2: everything left belongs to the provider-specific struct
         // (or the external plugin), which enforces its own unknown-field denial.
-        let rest = toml::Value::Table(table);
+        let rest = serde_json::Value::Object(table);
 
         let source_kind = match provider.as_str() {
             "github-releases" => SourceKind::GithubReleases(deserialize_strict(
@@ -628,7 +650,7 @@ impl AppFile {
 }
 
 fn deserialize_strict<T: for<'de> Deserialize<'de>>(
-    v: &toml::Value,
+    v: &serde_json::Value,
     file: &str,
     provider: &str,
 ) -> Result<T> {
@@ -637,7 +659,7 @@ fn deserialize_strict<T: for<'de> Deserialize<'de>>(
 
 /// Pop and deserialize one optional key, naming file + key on type errors.
 fn opt_field<T: serde::de::DeserializeOwned>(
-    table: &mut toml::map::Map<String, toml::Value>,
+    table: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
     file: &str,
 ) -> Result<Option<T>> {
@@ -659,7 +681,11 @@ pub fn load_apps(apps_dir: &Path) -> Result<Vec<AppFile>> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(apps_dir)
         .with_context(|| format!("reading {}", apps_dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| ConfigFormat::from_extension(e).is_some())
+        })
         .collect();
     entries.sort();
     for path in entries {
@@ -752,7 +778,7 @@ mod tests {
         match app.source_kind {
             SourceKind::External { id, raw } => {
                 assert_eq!(id, "myplug");
-                assert_eq!(raw.get("depth").and_then(|v| v.as_integer()), Some(3));
+                assert_eq!(raw.get("depth").and_then(|v| v.as_i64()), Some(3));
             }
             other => panic!("wrong kind {other:?}"),
         }
@@ -916,10 +942,10 @@ mod tests {
             app.install.extra["dest"].as_str(),
             Some("/opt/tool")
         );
-        assert_eq!(app.install.extra["mode"].as_integer(), Some(493));
+        assert_eq!(app.install.extra["mode"].as_i64(), Some(493));
         // extra_table round-trips the same content.
         match app.install.extra_table() {
-            toml::Value::Table(m) => assert_eq!(m.len(), 2),
+            serde_json::Value::Object(m) => assert_eq!(m.len(), 2),
             other => panic!("expected table, got {other:?}"),
         }
     }
@@ -947,5 +973,89 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-empty"), "{err}");
+    }
+
+    #[test]
+    fn yaml_and_json_apps_parse_like_toml() {
+        let yaml = r#"
+id: freecad
+provider: github-releases
+repo: FreeCAD/FreeCAD
+tag_regex: '^v?\d'
+asset_regex: '\.AppImage$'
+
+install:
+  type: appimage
+"#;
+        let app_yaml = AppFile::parse(yaml, "apps.d/freecad.yaml").unwrap();
+        assert_eq!(app_yaml.id, "freecad");
+        assert_eq!(app_yaml.provider, "github-releases");
+        assert_eq!(app_yaml.enabled, true);
+        assert_eq!(app_yaml.digest_policy, DigestPolicy::Prefer);
+        assert_eq!(
+            app_yaml.install.kind,
+            InstallType::Appimage
+        );
+
+        let json = r#"{
+            "id": "freecad",
+            "provider": "github-releases",
+            "repo": "FreeCAD/FreeCAD",
+            "tag_regex": "^v?\\d",
+            "asset_regex": "\\.AppImage$",
+            "install": { "type": "appimage" }
+        }"#;
+        let app_json = AppFile::parse(json, "apps.d/freecad.json").unwrap();
+        assert_eq!(app_json.id, "freecad");
+        assert_eq!(app_json.provider, "github-releases");
+        match (&app_json.source_kind, &app_yaml.source_kind) {
+            (
+                SourceKind::GithubReleases(a),
+                SourceKind::GithubReleases(b),
+            ) => {
+                assert_eq!(a.repo, b.repo);
+                assert_eq!(a.tag_regex, b.tag_regex);
+                assert_eq!(a.asset_regex, b.asset_regex);
+            }
+            other => panic!("wrong kinds {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_app_extension_rejected() {
+        let err = AppFile::parse(GH_OK, "apps.d/freecad.ini")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unsupported config extension"), "{msg}");
+        assert!(msg.contains(".toml"), "{msg}");
+    }
+    #[test]
+    fn global_config_loads_yaml_and_denies_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.yaml");
+        std::fs::write(&p, "max_parallel_checks: 7\n").unwrap();
+        let g = GlobalConfig::load(&p).unwrap();
+        assert_eq!(g.max_parallel_checks, 7);
+
+        std::fs::write(&p, "bogus_key: 1\n").unwrap();
+        let err = GlobalConfig::load(&p).unwrap_err();
+        assert!(format!("{err:#}").contains("bogus_key"), "{err:#}");
+    }
+
+    #[test]
+    fn config_file_probes_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = HomePaths {
+            config_dir: dir.path().to_path_buf(),
+            state_dir: dir.path().to_path_buf(),
+            cache_dir: dir.path().to_path_buf(),
+            desktop_dir: dir.path().to_path_buf(),
+            local_bin: dir.path().to_path_buf(),
+            relocated: true,
+        };
+        std::fs::write(dir.path().join("config.yaml"), "").unwrap();
+        assert_eq!(hp.config_file(), dir.path().join("config.yaml"));
+        std::fs::write(dir.path().join("config.toml"), "").unwrap();
+        assert_eq!(hp.config_file(), dir.path().join("config.toml"));
     }
 }

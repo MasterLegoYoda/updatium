@@ -408,7 +408,7 @@ pub struct InstallCtx<'a> {
     pub version: &'a str,
     pub cfg: &'a InstallCfg,
     /// Remaining `[install]` keys as a table; empty table for builtins.
-    pub extra: &'a toml::Value,
+    pub extra: &'a serde_json::Value,
     /// Digest-verified download (asset apps).
     pub download: Option<&'a Path>,
     /// Asset filename.
@@ -614,7 +614,7 @@ impl Installer for ExternalInstaller {
         let payload = serde_json::json!({
             "app": ctx.app_id,
             "version": ctx.version,
-            "config": serde_json::to_value(ctx.extra)?,
+            "config": ctx.extra,
             "paths": {
                 "download": ctx.download.map(|p| p.to_string_lossy().into_owned()),
                 "checkout": ctx.checkout.map(|p| p.to_string_lossy().into_owned()),
@@ -1093,8 +1093,8 @@ mod plugin_tests {
         p
     }
 
-    fn empty_table() -> toml::Value {
-        toml::Value::Table(toml::map::Map::new())
+    fn empty_table() -> serde_json::Value {
+        serde_json::Value::Object(Default::default())
     }
 
     #[test]

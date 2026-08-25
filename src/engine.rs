@@ -752,7 +752,7 @@ impl Engine {
 
         // Step 7: publish artifacts via the `dir` installer plugin.
         let inst = installer::lookup(&self.installers, "dir")?;
-        let empty_extra = toml::Value::Table(toml::map::Map::new());
+        let empty_extra = serde_json::Value::Object(Default::default());
         let ctx = installer::InstallCtx {
             app_id: &app.id,
             version: &target.version,
