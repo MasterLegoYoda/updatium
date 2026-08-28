@@ -5,6 +5,8 @@ pub mod docker_registry;
 pub mod github_releases;
 pub mod html_links;
 pub mod source_build;
+pub mod apt;
+pub mod flatpak;
 
 use crate::config::{AppSource, GlobalConfig};
 use anyhow::{Context as _, Result, bail};
@@ -56,6 +58,8 @@ pub const BUILTIN_PROVIDERS: &[&str] = &[
     "command",
     "source-build",
     "docker-registry",
+    "apt",
+    "flatpak",
 ];
 
 /// Build the provider registry: builtins plus discovered external plugins
@@ -76,6 +80,8 @@ pub fn registry(global: &GlobalConfig) -> HashMap<String, Arc<dyn Provider>> {
         "docker-registry".into(),
         Arc::new(docker_registry::DockerRegistry),
     );
+    map.insert("apt".into(), Arc::new(apt::Apt));
+    map.insert("flatpak".into(), Arc::new(flatpak::Flatpak));
 
     for ext in discover_external(global) {
         map.insert(format!("external:{}", ext.basename), Arc::new(ext));

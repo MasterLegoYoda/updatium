@@ -514,6 +514,41 @@ fn d_docker_api_base() -> String {
     "https://registry.hub.docker.com".into()
 }
 
+// --- provider = "apt" ------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AptCfg {
+    pub package: String,
+    #[serde(default)]
+    pub apply_cmd: Option<Vec<String>>,
+}
+
+// --- provider = "flatpak" --------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlatpakCfg {
+    pub app_id: String,
+    pub remote: String,
+    #[serde(default = "d_flatpak_user")]
+    pub user: bool,
+    #[serde(default = "d_flatpak_version_field")]
+    pub version_field: String,
+    #[serde(default)]
+    pub branch_regex: Option<String>,
+    #[serde(default)]
+    pub apply_cmd: Option<Vec<String>>,
+}
+
+fn d_flatpak_user() -> bool {
+    true
+}
+
+fn d_flatpak_version_field() -> String {
+    "auto".into()
+}
+
 // ---------------------------------------------------------------------------
 // AppSource: what a Provider receives
 // ---------------------------------------------------------------------------
@@ -525,6 +560,8 @@ pub enum SourceKind {
     Command(CommandCfg),
     SourceBuild(SourceBuildCfg),
     DockerRegistry(DockerRegistryCfg),
+    Apt(AptCfg),
+    Flatpak(FlatpakCfg),
     /// External plugin; raw remaining config passed as JSON on stdin.
     External {
         id: String,
@@ -625,6 +662,8 @@ impl AppFile {
                 path_for_errors,
                 "docker-registry",
             )?),
+            "apt" => SourceKind::Apt(deserialize_strict(&rest, path_for_errors, "apt")?),
+            "flatpak" => SourceKind::Flatpak(deserialize_strict(&rest, path_for_errors, "flatpak")?),
             other if other.starts_with("external:") => SourceKind::External {
                 id: other["external:".len()..].to_string(),
                 raw: rest,
@@ -632,7 +671,8 @@ impl AppFile {
             _ => {
                 bail!(
                     "{path_for_errors}: unknown provider '{provider}' (valid: github-releases, \
-                     html-links, command, source-build, docker-registry, external:<name>)"
+                     html-links, command, source-build, docker-registry, apt, flatpak, \
+                     external:<name>)"
                 )
             }
         };

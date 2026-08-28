@@ -87,10 +87,14 @@ pub struct RunOut {
 
 const TAIL_LINES: usize = 200;
 
-fn tail(s: &str) -> String {
+fn tail_n(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
-    let start = lines.len().saturating_sub(TAIL_LINES);
+    let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
+}
+
+fn tail(s: &str) -> String {
+    tail_n(s, TAIL_LINES)
 }
 
 /// Expand a leading `~` in each argv element (commands are exec'd without a
@@ -116,7 +120,18 @@ pub async fn run(
     timeout: Duration,
     capture: bool,
 ) -> Result<RunOut> {
-    run_with_stdin(cmd, cwd, timeout, capture, None, &[]).await
+    run_impl(cmd, cwd, timeout, capture, None, &[], Some(TAIL_LINES)).await
+}
+
+/// Like [`run`] with capture, but retains the FULL stdout/stderr (no tail cap).
+/// For commands whose meaningful output exceeds the 200-line tail, e.g.
+/// `flatpak remote-ls` listing an entire remote.
+pub async fn run_full(
+    cmd: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+) -> Result<RunOut> {
+    run_impl(cmd, cwd, timeout, true, None, &[], None).await
 }
 
 /// Like [`run`] but pipes `stdin_bytes` to the child when provided and
@@ -131,7 +146,7 @@ pub async fn run_with_stdin(
 ) -> Result<RunOut> {
     let env_pairs: Vec<(String, String)> =
         env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-    run_impl(cmd, cwd, timeout, capture, stdin_bytes, &env_pairs).await
+    run_impl(cmd, cwd, timeout, capture, stdin_bytes, &env_pairs, Some(TAIL_LINES)).await
 }
 
 /// Like [`run`] but overlays `env` on top of inherited environment variables.
@@ -145,7 +160,7 @@ pub async fn run_env(
 ) -> Result<RunOut> {
     let env_pairs: Vec<(String, String)> =
         env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    run_impl(cmd, cwd, timeout, capture, None, &env_pairs).await
+    run_impl(cmd, cwd, timeout, capture, None, &env_pairs, Some(TAIL_LINES)).await
 }
 
 async fn run_impl(
@@ -155,6 +170,7 @@ async fn run_impl(
     capture: bool,
     stdin_bytes: Option<&[u8]>,
     env: &[(String, String)],
+    tail_lines: Option<usize>,
 ) -> Result<RunOut> {
     if cmd.is_empty() {
         bail!("refusing to execute empty command");
@@ -215,10 +231,18 @@ async fn run_impl(
             r1.context("reading stdout")?;
             r2.context("reading stderr")?;
             let status = r3.context("waiting for process")?;
+            let stdout_tail = match tail_lines {
+                Some(n) => tail_n(&so, n),
+                None => so,
+            };
+            let stderr_tail = match tail_lines {
+                Some(n) => tail_n(&se, n),
+                None => se,
+            };
             Ok(RunOut {
                 status: status.success(),
-                stdout_tail: tail(&so),
-                stderr_tail: tail(&se),
+                stdout_tail,
+                stderr_tail,
             })
         } else {
             let status = child.wait().await.context("waiting for process")?;
@@ -324,6 +348,22 @@ mod tests {
         assert!(o.status);
         assert_eq!(o.stdout_tail, "out1\nout2");
         assert_eq!(o.stderr_tail, "err1");
+    }
+
+    #[tokio::test]
+    async fn run_full_keeps_all_lines_beyond_tail_cap() {
+        let cmd = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "seq 1 500".to_string(),
+        ];
+        let o = run_full(&cmd, None, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(o.status);
+        assert_eq!(o.stdout_tail.lines().count(), 500);
+        assert_eq!(o.stdout_tail.lines().next(), Some("1"));
+        assert_eq!(o.stdout_tail.lines().last(), Some("500"));
     }
 
     #[tokio::test]

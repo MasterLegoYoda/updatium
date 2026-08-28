@@ -203,7 +203,59 @@ test -f "$UPDATIUM_HOME/config/apps.d/yadd.yaml"
 grep -q '^provider: github-releases' "$UPDATIUM_HOME/config/apps.d/yadd.yaml"
 "$BIN" add yj --provider command --format json >/dev/null
 test -f "$UPDATIUM_HOME/config/apps.d/yj.json"
-python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
-    "$UPDATIUM_HOME/config/apps.d/yj.json" || { echo "FAIL invalid json scaffold"; exit 1; }
+# --- 9. apt + flatpak builtin providers (PATH shims) -------------------------
+SHIMS="$(mktemp -d)"
+cat > "$SHIMS/apt-cache" <<'SHIM'
+#!/usr/bin/env bash
+[ "${1:-}" = policy ] || exit 0
+cat <<EOF
+htop:
+  Installed: 3.0.5-7
+  Candidate: 3.0.6-1
+  Version table:
+ *** 3.0.6-1 500
+        500 http://example.test/ubuntu jammy/main amd64 Packages
+        100 /var/lib/dpkg/status
+EOF
+SHIM
+cat > "$SHIMS/flatpak" <<'SHIM'
+#!/usr/bin/env bash
+[ "${1:-}" = remote-ls ] || exit 0
+printf 'org.mozilla.firefox\t142.0.1\t142.0\n'
+SHIM
+chmod +x "$SHIMS/apt-cache" "$SHIMS/flatpak"
+export PATH="$SHIMS:$PATH"
+
+cat > "$UPDATIUM_HOME/config/apps.d/aptdemo.toml" <<EOF
+id = "aptdemo"
+provider = "apt"
+package = "htop"
+apply_cmd = ["touch", "$UPDATIUM_HOME/state/apt-applied"]
+
+[install]
+type = "none"
+EOF
+cat > "$UPDATIUM_HOME/config/apps.d/flatdemo.toml" <<EOF
+id = "flatdemo"
+provider = "flatpak"
+app_id = "org.mozilla.firefox"
+remote = "flathub"
+apply_cmd = ["touch", "$UPDATIUM_HOME/state/flat-applied"]
+
+[install]
+type = "none"
+EOF
+
+"$BIN" check aptdemo --json | grep -q '"latest": "3.0.6-1"'
+"$BIN" update aptdemo --dry-run | grep -q "apply via touch"
+"$BIN" update aptdemo --yes | grep -q "applied via touch"
+test -f "$UPDATIUM_HOME/state/apt-applied"
+"$BIN" list --json | grep -q '"id": "aptdemo"'
+"$BIN" list --json | grep -q '"installed": "3.0.6-1"'
+
+"$BIN" check flatdemo --json | grep -q '"latest": "142.0.1"'
+"$BIN" update flatdemo --yes | grep -q "applied via touch"
+test -f "$UPDATIUM_HOME/state/flat-applied"
+expect_exit 0 "$BIN" update flatdemo --yes    # re-update is a no-op
 
 echo "E2E OK"

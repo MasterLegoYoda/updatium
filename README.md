@@ -10,6 +10,8 @@ heterogeneous channels:
 | Self-managed version managers | `command` | nvm / pyenv |
 | Build-from-source repos | `source-build` | llama.cpp (`b1234` tags) |
 | Docker image tags | `docker-registry` | Docker Hub, ghcr.io (lobe-chat, open-webui) |
+| apt repositories | `apt` | htop (track-only, or apply via sudo) |
+| Flatpak remotes | `flatpak` | Firefox on Flathub |
 
 Provider-based architecture: new sources plug in without touching the core.
 First version ships **CLI + TUI**; the engine is a reusable library so a future
@@ -164,6 +166,21 @@ releases, `[build]`: `steps`, `tracked_files`, `artifacts`, `timeout_secs`
 (`docker.io/<owner>/<name>`, bare `owner/name`, or `<registry>/<host-path>`),
 `tag_regex`, required `pull_cmd`, optional `redeploy_cmd`, `api_base`.
 `{version}`, `{image}`, `{registry}`, `{repo}` are substitutable in commands.
+
+**`apt`** — `package` (required), optional `apply_cmd` (omit = track-only;
+`{package}` and `{version}` substitutable). `check` reads the `Candidate:`
+version from `apt-cache policy <package>`; no candidate means no release.
+Nothing runs as root implicitly — an unattended `apply_cmd` should start with a
+privilege-escalation prefix such as `sudo -n apt-get install --only-upgrade -y`.
+
+**`flatpak`** — `app_id` and `remote` (required), `user` (default true:
+`--user` scope; false = `--system`), `version_field`
+(`"version" | "branch" | "auto"`, default `auto`: Version column when non-empty
+else Branch), optional `branch_regex` (filter on branch; multiple matching
+branches become multiple releases and the engine picks the highest via
+`cmp_version`), optional `apply_cmd` (omit = track-only; `{app_id}`, `{remote}`,
+`{version}` substitutable). `check` lists the remote with
+`flatpak remote-ls --user|--system <remote> --app`.
 
 ## CLI
 

@@ -402,6 +402,16 @@ impl Engine {
                     actions.push(format!("redeploy via {}", r.join(" ")));
                 }
             }
+            SourceKind::Apt(c) => {
+                if let Some(apply) = &c.apply_cmd {
+                    actions.push(format!("apply via {}", apply.join(" ")));
+                }
+            }
+            SourceKind::Flatpak(f) => {
+                if let Some(apply) = &f.apply_cmd {
+                    actions.push(format!("apply via {}", apply.join(" ")));
+                }
+            }
             SourceKind::External { .. } => {}
         }
         match &app.install.kind {
@@ -485,15 +495,8 @@ impl Engine {
                 if let Some(apply) = &c.apply_cmd {
                     let vars = BTreeMap::from([("version", target.version.as_str())]);
                     let argv = exec::substitute(apply, &vars)?;
-                    let out =
-                        exec::run(&argv, None, std::time::Duration::from_secs(600), true).await?;
-                    anyhow::ensure!(out.status, "apply_cmd failed:\n{}", out.stderr_tail);
-                    self.store.event(
-                        "applied",
-                        Some(&app.id),
-                        Some(&serde_json::json!({"cmd": argv}).to_string()),
-                    )?;
-                    rep.actions.push(format!("applied via {}", argv.join(" ")));
+                    let detail = serde_json::json!({"cmd": &argv});
+                    self.run_apply_cmd(app, &argv, &detail, rep).await?;
                 } else {
                     rep.actions.push("track-only (no apply_cmd)".into());
                 }
@@ -504,6 +507,20 @@ impl Engine {
             }
             SourceKind::DockerRegistry(d) => {
                 self.apply_docker(app, d, target, rep).await?;
+                self.store.set_installed(&app.id, &target.version)?;
+                rep.actions
+                    .push(format!("set installed = {}", target.version));
+                return Ok(());
+            }
+            SourceKind::Apt(c) => {
+                self.apply_apt(app, c, target, rep).await?;
+                self.store.set_installed(&app.id, &target.version)?;
+                rep.actions
+                    .push(format!("set installed = {}", target.version));
+                return Ok(());
+            }
+            SourceKind::Flatpak(f) => {
+                self.apply_flatpak(app, f, target, rep).await?;
                 self.store.set_installed(&app.id, &target.version)?;
                 rep.actions
                     .push(format!("set installed = {}", target.version));
@@ -877,6 +894,71 @@ impl Engine {
             .push(format!("set installed = {}", target.version));
         let _ = app;
         Ok(())
+    }
+
+    /// Run a provider `apply_cmd`, recording the `applied` event and a report
+    /// action. Shares the docker apply timeout rule.
+    async fn run_apply_cmd(
+        &self,
+        app: &AppFile,
+        argv: &[String],
+        detail: &serde_json::Value,
+        rep: &mut UpdateReport,
+    ) -> Result<()> {
+        let out = exec::run(
+            argv,
+            None,
+            std::time::Duration::from_secs(self.global.download_timeout_secs.max(600)),
+            true,
+        )
+        .await?;
+        anyhow::ensure!(out.status, "apply_cmd failed:\n{}", out.stderr_tail);
+        self.store
+            .event("applied", Some(&app.id), Some(&detail.to_string()))?;
+        rep.actions.push(format!("applied via {}", argv.join(" ")));
+        Ok(())
+    }
+
+    async fn apply_apt(
+        &self,
+        app: &AppFile,
+        cfg: &crate::config::AptCfg,
+        target: &Release,
+        rep: &mut UpdateReport,
+    ) -> Result<()> {
+        let Some(apply) = &cfg.apply_cmd else {
+            rep.actions.push("track-only (no apply_cmd)".into());
+            return Ok(());
+        };
+        let vars: BTreeMap<&str, &str> = BTreeMap::from([
+            ("package", cfg.package.as_str()),
+            ("version", target.version.as_str()),
+        ]);
+        let argv = exec::substitute(apply, &vars)?;
+        let detail = serde_json::json!({"package": cfg.package, "version": target.version});
+        self.run_apply_cmd(app, &argv, &detail, rep).await
+    }
+
+    async fn apply_flatpak(
+        &self,
+        app: &AppFile,
+        cfg: &crate::config::FlatpakCfg,
+        target: &Release,
+        rep: &mut UpdateReport,
+    ) -> Result<()> {
+        let Some(apply) = &cfg.apply_cmd else {
+            rep.actions.push("track-only (no apply_cmd)".into());
+            return Ok(());
+        };
+        let vars: BTreeMap<&str, &str> = BTreeMap::from([
+            ("app_id", cfg.app_id.as_str()),
+            ("remote", cfg.remote.as_str()),
+            ("version", target.version.as_str()),
+        ]);
+        let argv = exec::substitute(apply, &vars)?;
+        let detail =
+            serde_json::json!({"app_id": cfg.app_id, "remote": cfg.remote, "version": target.version});
+        self.run_apply_cmd(app, &argv, &detail, rep).await
     }
 
     async fn apply_docker(

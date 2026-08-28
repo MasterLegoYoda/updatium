@@ -326,6 +326,34 @@ redeploy_cmd = ["docker", "compose", "-f", "~/compose.yaml", "up", "-d"]   # opt
 type = "none"
 "#,
     ),
+    (
+        "apt",
+        r#"
+id = "<ID>"
+provider = "apt"
+package = "htop"                  # required: apt package name
+apply_cmd = ["sudo", "-n", "apt-get", "install", "--only-upgrade", "-y", "htop"]   # omit = track-only
+
+[install]
+type = "none"
+"#,
+    ),
+    (
+        "flatpak",
+        r#"
+id = "<ID>"
+provider = "flatpak"
+app_id = "org.mozilla.firefox"    # required: flatpak application id
+remote = "flathub"                # required: remote name
+user = true                       # --user scope (default true); false = --system
+version_field = "auto"            # version | branch | auto
+branch_regex = ""                 # optional regex filter on branch
+apply_cmd = ["flatpak", "install", "--user", "-y", "flathub", "org.mozilla.firefox"]   # omit = track-only
+
+[install]
+type = "none"
+"#,
+    ),
 ];
 
 fn cmd_add(cli: &Cli, id: &str, provider: &str, edit: bool, fmt: ScaffoldFormat) -> Result<()> {
