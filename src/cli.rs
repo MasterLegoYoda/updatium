@@ -357,13 +357,26 @@ type = "none"
 ];
 
 fn cmd_add(cli: &Cli, id: &str, provider: &str, edit: bool, fmt: ScaffoldFormat) -> Result<()> {
+    let path = create_app_scaffold(cli.home.as_deref(), id, provider, fmt)?;
+    println!("wrote {}", path.display());
+    if edit {
+        edit_config(&path)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn create_app_scaffold(
+    home: Option<&Path>,
+    id: &str,
+    provider: &str,
+    fmt: ScaffoldFormat,
+) -> Result<PathBuf> {
     if !provider.starts_with("external:") {
         anyhow::ensure!(
             PROVIDER_TEMPLATES.iter().any(|(p, _)| *p == provider),
             "unknown provider '{provider}'"
         );
     }
-    // Validate id charset early: it becomes a filename.
     anyhow::ensure!(
         !id.is_empty()
             && id
@@ -371,7 +384,7 @@ fn cmd_add(cli: &Cli, id: &str, provider: &str, edit: bool, fmt: ScaffoldFormat)
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
         "app id must be [a-zA-Z0-9_-]: {id:?}"
     );
-    let engine = Engine::new(cli.home.as_deref())?;
+    let engine = Engine::new(home)?;
     let dir = engine.home_paths().apps_d();
     let cfg_fmt = fmt.config_format();
     let path = dir.join(format!("{id}.{}", cfg_fmt.extension()));
@@ -391,9 +404,6 @@ type = "none"
 "#
         )
     };
-    // Templates are TOML text (single source of truth). Toml keeps the raw
-    // template so its comments survive; other formats transcode through the
-    // canonical IR.
     let body = if fmt == ScaffoldFormat::Toml {
         body
     } else {
@@ -401,15 +411,48 @@ type = "none"
         cfg_fmt.serialize(&ir)?
     };
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    println!("wrote {}", path.display());
+    Ok(path)
+}
 
-    if edit {
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-        let st = std::process::Command::new(editor).arg(&path).status()?;
-        anyhow::ensure!(st.success(), "$EDITOR failed");
-    }
+pub(crate) fn edit_config(path: &Path) -> Result<()> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let status = std::process::Command::new(editor).arg(path).status()?;
+    anyhow::ensure!(status.success(), "$EDITOR failed");
     Ok(())
 }
+
+pub(crate) fn manage_desktop(e: &Engine, id: &str, remove: bool) -> Result<()> {
+    if remove {
+        crate::desktop::remove_desktop(&e.home_paths().desktop_dir, id)?;
+        return Ok(());
+    }
+    let app: AppFile = crate::config::load_apps(&e.home_paths().apps_d())?
+        .into_iter()
+        .find(|a| a.id == id)
+        .with_context(|| format!("unknown app '{id}'"))?;
+    let d = app
+        .install
+        .desktop
+        .as_ref()
+        .context("app has no [install.desktop]")?;
+    let current = e.home_paths().install_current(id);
+    let exec_hint =
+        first_executable_under(&current, &app.install.link_bins).unwrap_or(current);
+    crate::desktop::write_desktop(
+        &e.home_paths().desktop_dir,
+        id,
+        &d.name,
+        &exec_hint,
+        d.icon
+            .as_deref()
+            .map(crate::config::expand_tilde)
+            .as_deref(),
+        &d.categories,
+        d.terminal,
+    )?;
+    Ok(())
+}
+
 
 fn summarize_exit(failures: usize, pending: usize) -> Result<i32> {
     Ok(if failures > 0 || pending > 0 { 2 } else { 0 })
@@ -658,36 +701,12 @@ fn dispatch(cli: &Cli) -> Result<i32> {
         }
         Cmd::Desktop { id, remove } => {
             let e = Engine::new(cli.home.as_deref())?;
+            manage_desktop(&e, id, *remove)?;
             if *remove {
-                crate::desktop::remove_desktop(&e.home_paths().desktop_dir, id)?;
                 println!("removed desktop entry for '{id}' (if present)");
-                return Ok(0);
+            } else {
+                println!("wrote desktop entry for '{id}'");
             }
-            // Regenerate from current install state.
-            let app: AppFile = crate::config::load_apps(&e.home_paths().apps_d())?
-                .into_iter()
-                .find(|a| a.id == *id)
-                .with_context(|| format!("unknown app '{id}'"))?;
-            let d = app
-                .install
-                .desktop
-                .context("app has no [install.desktop]")?;
-            let current = e.home_paths().install_current(id);
-            let exec_hint =
-                first_executable_under(&current, &app.install.link_bins).unwrap_or(current);
-            crate::desktop::write_desktop(
-                &e.home_paths().desktop_dir,
-                id,
-                &d.name,
-                &exec_hint,
-                d.icon
-                    .as_deref()
-                    .map(crate::config::expand_tilde)
-                    .as_deref(),
-                &d.categories,
-                d.terminal,
-            )?;
-            println!("wrote desktop entry for '{id}'");
             Ok(0)
         }
         Cmd::Tui { print_frame } => crate::tui::run(cli.home.as_deref(), *print_frame),

@@ -202,8 +202,7 @@ pending approvals (script-friendly).
 
 Status markers: `● ok ▲ update ⚠ approval ✖ error · unchecked`.
 
-TUI keys: `r` refresh · `u` update selected · `a` approve selected ·
-`j/k/arrows/pgup/pgdn` navigate · `d` detail pane · `q` quit.
+TUI keys: `/` search · `f` cycle status filters · `r` refresh · `u` update selected · `U` bulk update eligible apps · `a` approve · `j/k/arrows/pgup/pgdn` navigate · `d` app history · `e` edit config in `$EDITOR` · `n` create app · `x` delete config only · `g/G` write/remove desktop entry · `p` plugins · `F1` help · `q` quit. Destructive actions ask for confirmation; app-config deletion retains installed files, desktop entry, and database history/state.
 `updatium tui --print-frame` renders one frame from DB state and exits — CI-safe.
 
 ## Security model
