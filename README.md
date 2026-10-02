@@ -19,13 +19,28 @@ GUI needs no engine changes.
 
 ## Build & install
 
+The repository includes a portable installer for Linux. It builds the release
+binary from the checkout and installs it into `~/.local/bin` by default:
+
 ```bash
-cargo build --release
-install -Dm755 target/release/updatium ~/.local/bin/updatium
+./install.sh
 ```
 
-Requirements: Rust 1.90+, `git`, a C compiler for the bundled SQLite. Linux only
-in this MVP (XDG dirs, freedesktop entries).
+Use `--prefix` or `PREFIX` to choose another installation prefix:
+
+```bash
+./install.sh --prefix "$HOME/.local"
+PREFIX="$HOME/.local" ./install.sh
+```
+
+Requirements: Rust 1.90+, `git`, and a C compiler for the bundled SQLite. Linux only
+in this MVP (XDG dirs, freedesktop entries). Run `./install.sh --help` for all options.
+
+For a direct development build without installing:
+
+```bash
+cargo build --release
+```
 
 ## Quickstart
 
