@@ -77,23 +77,27 @@ The AppImage lands in `~/Applications` (mode 0755) and a
 ### llama.cpp built from source
 
 ```toml
-id = "llamacpp"
+id = "llama.cpp"
 provider = "source-build"
 repo_url = "https://github.com/ggml-org/llama.cpp"
+source_dir = "/home/noesis/Software/llamacpp/llama.cpp"
+install_dir = "/home/noesis/Software/llama.cpp"
 ref_regex = '^refs/tags/b\d+$'
 
 [build]
-steps = [["cmake", "-B", "build"], ["cmake", "--build", "build", "-j"]]
-tracked_files = ["CMakeLists.txt", "cmake/**", "scripts/*.sh"]
+steps = [["cmake", "-B", "build", "-DGGML_CUDA=ON"], ["cmake", "--build", "build", "-j"]]
+tracked_files = ["CMakeLists.txt", "cmake/**", "ggml/CMakeLists.txt", "ggml/src/**"]
 artifacts = ["build/bin/*"]
+install_steps = [["cmake", "--install", "build", "--prefix", "{install_dir}", "--strip"]]
 timeout_secs = 3600
 env = { CMAKE_BUILD_TYPE = "Release" }
 
 [install]
 type = "dir"
-link_bins = ["llama-cli"]
+link_bins = ["llama-cli", "llama-server"]
 ```
 
+`source_dir` reuses an existing checkout, and `install_dir` with `install_steps` stages a replacement for an external installation directory after a successful build. `{install_dir}` is substituted with a staging path before the old directory is replaced.
 `tracked_files` are hashed after every build. If they change upstream,
 the next update **stops before building** (`⚠ approval`) and snapshots both
 states. Review and clear with:

@@ -47,6 +47,8 @@ async fn lists_and_filters_tags_from_local_repo() {
         repo_url: repo.path().to_string_lossy().into_owned(),
         ref_regex: r"^refs/tags/b\d+$".into(),
         api_base: None,
+        source_dir: None,
+        install_dir: None,
         build: crate_build_cfg(),
     };
     let rels = SourceBuild
@@ -70,6 +72,8 @@ async fn no_matching_refs_is_empty_not_error() {
         repo_url: repo.path().to_string_lossy().into_owned(),
         ref_regex: r"^refs/tags/nope-\d+$".into(),
         api_base: None,
+        source_dir: None,
+        install_dir: None,
         build: crate_build_cfg(),
     };
     let rels = SourceBuild
@@ -85,6 +89,7 @@ fn crate_build_cfg() -> updatium::config::BuildCfg {
         steps = [["true"]]
         tracked_files = ["CMakeLists.txt"]
         artifacts = []
+        install_steps = []
         "#,
     )
     .unwrap()

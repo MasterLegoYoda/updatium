@@ -474,6 +474,9 @@ pub struct BuildCfg {
     pub steps: Vec<Vec<String>>,
     pub tracked_files: Vec<String>,
     pub artifacts: Vec<String>,
+    /// Optional post-build commands; `{install_dir}` is replaced with a staging path.
+    #[serde(default)]
+    pub install_steps: Vec<Vec<String>>,
     #[serde(default = "d_build_timeout")]
     pub timeout_secs: u64,
     #[serde(default)]
@@ -492,6 +495,12 @@ pub struct SourceBuildCfg {
     /// If set, ALSO query GitHub releases for faster metadata.
     #[serde(default)]
     pub api_base: Option<String>,
+    /// Existing checkout to fetch and build instead of the managed source root.
+    #[serde(default)]
+    pub source_dir: Option<String>,
+    /// Directory replaced with the selected build artifacts after a successful build.
+    #[serde(default)]
+    pub install_dir: Option<String>,
     pub build: BuildCfg,
 }
 

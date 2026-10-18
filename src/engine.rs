@@ -637,20 +637,15 @@ impl Engine {
 
     /// Clone (first time) or fetch an existing checkout, then detach onto the
     /// target tag. Tries the bare version first, then a `v`-prefixed tag.
-    async fn checkout_source(&self, repo_url: &str, id: &str, version: &str) -> Result<PathBuf> {
-        let src_root = self.home.src();
-        std::fs::create_dir_all(&src_root)?;
-        let dir = src_root.join(id);
+    /// Fetch/update a configured checkout or the managed source root, then detach onto the target tag.
+    async fn checkout_source(&self, repo_url: &str, id: &str, version: &str, source_dir: Option<&str>) -> Result<PathBuf> {
+        let dir = source_dir
+            .map(crate::config::expand_tilde)
+            .unwrap_or_else(|| self.home.src().join(id));
         let timeout = std::time::Duration::from_secs(300);
-
         if dir.join(".git").exists() {
             let out = exec::run(
-                &[
-                    "git".into(),
-                    "fetch".into(),
-                    "--tags".into(),
-                    "--force".into(),
-                ],
+                &["git".into(), "fetch".into(), "--tags".into(), "--force".into()],
                 Some(&dir),
                 timeout,
                 true,
@@ -658,6 +653,12 @@ impl Engine {
             .await?;
             anyhow::ensure!(out.status, "git fetch failed:\n{}", out.stderr_tail);
         } else {
+            if dir.exists() {
+                bail!("configured source_dir exists but is not a git checkout: {}", dir.display());
+            }
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             let out = exec::run(
                 &[
                     "git".into(),
@@ -673,15 +674,9 @@ impl Engine {
             .await?;
             anyhow::ensure!(out.status, "git clone failed:\n{}", out.stderr_tail);
         }
-
         for tag in [version.to_string(), format!("v{version}")] {
             let out = exec::run(
-                &[
-                    "git".into(),
-                    "checkout".into(),
-                    "--detach".into(),
-                    tag.clone(),
-                ],
+                &["git".into(), "checkout".into(), "--detach".into(), tag],
                 Some(&dir),
                 timeout,
                 true,
@@ -704,7 +699,7 @@ impl Engine {
     ) -> Result<()> {
         // Step 5: checkout + integrity gate.
         let checkout = self
-            .checkout_source(&sb.repo_url, &app.id, &target.version)
+            .checkout_source(&sb.repo_url, &app.id, &target.version, sb.source_dir.as_deref())
             .await?;
         rep.actions.push(format!("checked out {}", target.version));
 
@@ -767,7 +762,46 @@ impl Engine {
             rep.actions.push(format!("build[{}] ok", step[0]));
         }
 
-        // Step 7: publish artifacts via the `dir` installer plugin.
+        // Step 7: install into a configured external directory via a staging prefix.
+        if let Some(install_dir) = sb.install_dir.as_deref() {
+            if sb.build.install_steps.is_empty() {
+                bail!("install_dir requires at least one build.install_steps command");
+            }
+            let destination = crate::config::expand_tilde(install_dir);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let staging_root = destination.with_file_name(format!(".{}-staging-{}", app.id, target.version));
+            let _ = std::fs::remove_dir_all(&staging_root);
+            std::fs::create_dir_all(&staging_root)?;
+            let staging_text = staging_root.to_string_lossy().into_owned();
+            let mut vars = BTreeMap::new();
+            vars.insert("install_dir", staging_text.as_str());
+            for (i, step) in sb.build.install_steps.iter().enumerate() {
+                let command = exec::substitute(step, &vars)?;
+                let out = exec::run_env(&command, Some(&checkout), timeout, &sb.build.env, true)
+                    .await
+                    .with_context(|| format!("install step {} ({}) failed to start", i + 1, command.join(" ")))?;
+                anyhow::ensure!(
+                    out.status,
+                    "install step {} ({}) failed:\n{}",
+                    i + 1,
+                    command.join(" "),
+                    out.stderr_tail
+                );
+                rep.actions.push(format!("install[{}] ok", command[0]));
+            }
+            if destination.exists() {
+                std::fs::remove_dir_all(&destination)
+                    .with_context(|| format!("replacing {}", destination.display()))?;
+            }
+            std::fs::rename(&staging_root, &destination)
+                .with_context(|| format!("activating {}", destination.display()))?;
+            self.store.event("install_ok", Some(&app.id), None)?;
+            return self.post_build_finish(app, target, rep).await;
+        }
+
+        // Default path: publish through Updatium's managed installer tree.
         let inst = installer::lookup(&self.installers, "dir")?;
         let empty_extra = serde_json::Value::Object(Default::default());
         let ctx = installer::InstallCtx {
@@ -789,8 +823,6 @@ impl Engine {
         self.publish_common(app, pubn, rep)?;
         self.post_build_finish(app, target, rep).await
     }
-
-    /// Shared post-install bookkeeping (events, state, desktop).
     fn finish_install(
         &self,
         app: &AppFile,
@@ -1063,7 +1095,11 @@ impl Engine {
             SourceKind::SourceBuild(sb) => sb.clone(),
             _ => bail!("approval gate applies only to source-build apps"),
         };
-        let checkout = self.home.src().join(id);
+        let checkout = sb
+            .source_dir
+            .as_deref()
+            .map(crate::config::expand_tilde)
+            .unwrap_or_else(|| self.home.src().join(id));
         anyhow::ensure!(
             checkout.exists(),
             "no checkout at {} for '{id}' — run an update first",

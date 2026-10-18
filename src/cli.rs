@@ -305,7 +305,7 @@ ref_regex = '^refs/tags/b\d+$'
 [build]
 steps = [["cmake", "-B", "build"], ["cmake", "--build", "build", "-j"]]
 tracked_files = ["CMakeLists.txt", "cmake/**", "scripts/*.sh"]
-artifacts = ["build/bin/*"]
+install_steps = [["cmake", "--install", "build", "--prefix", "{install_dir}", "--strip"]]
 
 [install]
 type = "dir"
