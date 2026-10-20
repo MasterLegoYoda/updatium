@@ -26,7 +26,10 @@ impl Provider for SourceBuild {
             .with_context(|| format!("bad ref_regex {:?}", cfg.ref_regex))?;
 
         // argv-direct git invocation: no shell, no injection surface.
-        let out = crate::exec::run(
+        // Full stdout is required: large repos (llama.cpp has >8000 tag refs)
+        // exceed exec's 200-line capture tail, and the matching tags may all
+        // sit before that tail (e.g. `b1234` tags sort before the `v*` tags).
+        let out = crate::exec::run_full(
             &[
                 "git".to_string(),
                 "ls-remote".to_string(),
@@ -35,7 +38,6 @@ impl Provider for SourceBuild {
             ],
             None,
             Duration::from_secs(120),
-            true,
         )
         .await
         .context("running git ls-remote --tags")?;

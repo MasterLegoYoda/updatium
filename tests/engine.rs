@@ -110,6 +110,44 @@ async fn full_appimage_lifecycle() {
 }
 
 #[tokio::test]
+async fn latest_comes_from_current_result_not_stale_history() {
+    let (base, _guard) = common::spawn().await;
+    let home = tempfile::tempdir().unwrap();
+    let write = |tag_regex: &str, prereleases: bool| {
+        write_app(
+            home.path(),
+            "demo",
+            &format!(
+                r#"
+id = "demo"
+provider = "github-releases"
+allow_insecure_http = true
+repo = "demo/app"
+tag_regex = '{tag_regex}'
+include_prereleases = {prereleases}
+api_base = "{base}/gh"
+
+[install]
+type = "none"
+"#
+            ),
+        );
+    };
+    let e = engine(home.path());
+
+    // Record the prerelease 2.0.0 as the newest known version.
+    write(r"^v?2\.0\.0$", true);
+    let reports = e.check(None).await.unwrap();
+    assert_eq!(reports[0].latest.as_deref(), Some("2.0.0"));
+
+    // Tighten the filter so 2.0.0 is no longer advertised. The report must
+    // follow the current result set (1.8.0), not the all-time DB maximum.
+    write(r"^v?1\.8\.0$", false);
+    let reports = e.check(None).await.unwrap();
+    assert_eq!(reports[0].latest.as_deref(), Some("1.8.0"));
+}
+
+#[tokio::test]
 async fn poisoned_digest_hard_stops_with_verify_failed_event() {
     let (base, _guard) = common::spawn().await;
     let home = tempfile::tempdir().unwrap();
@@ -187,6 +225,79 @@ fn make_git_repo_with_tags(path: &Path) {
     git(&["commit", "-qm", "one"]);
     git(&["tag", "b1000"]);
     git(&["tag", "b2000"]);
+}
+
+/// Two sequential commits tagged b1000 and b2000, ending detached at b1000.
+fn make_git_repo_with_sequential_tags(path: &Path) {
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(path.join("README.md"), b"build me v1\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "one"]);
+    git(&["tag", "b1000"]);
+    std::fs::write(path.join("README.md"), b"build me v2\n").unwrap();
+    git(&["commit", "-qam", "two"]);
+    git(&["tag", "b2000"]);
+    git(&["checkout", "-q", "b1000"]);
+}
+
+#[tokio::test]
+async fn check_detects_source_build_version_from_checkout() {
+    let (base, _guard) = common::spawn().await;
+    let _ = base; // fixture unused here but keeps parity with other suites
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    make_git_repo_with_sequential_tags(repo_dir.path());
+
+    let home = tempfile::tempdir().unwrap();
+    let install_dir = home.path().join("llama-install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    write_app(
+        home.path(),
+        "srcdemo",
+        &format!(
+            r#"
+id = "srcdemo"
+provider = "source-build"
+repo_url = "{repo}"
+source_dir = "{repo}"
+install_dir = "{install}"
+ref_regex = '^refs/tags/b\d+$'
+
+[build]
+steps = [["true"]]
+tracked_files = ["README.md"]
+artifacts = []
+
+[install]
+type = "dir"
+"#,
+            repo = repo_dir.path().display(),
+            install = install_dir.display(),
+        ),
+    );
+    let e = engine(home.path());
+
+    // No DB install state, but the checkout is at b1000 -> report it.
+    let reports = e.check(None).await.unwrap();
+    assert_eq!(reports[0].installed.as_deref(), Some("b1000"));
+    assert_eq!(reports[0].latest.as_deref(), Some("b2000"));
+    assert!(matches!(reports[0].status, Status::UpdateAvailable));
+    assert_eq!(
+        e.installed_version("srcdemo").unwrap().as_deref(),
+        Some("b1000")
+    );
 }
 
 #[tokio::test]

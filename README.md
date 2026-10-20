@@ -98,7 +98,9 @@ link_bins = ["llama-cli", "llama-server"]
 ```
 
 `source_dir` reuses an existing checkout, and `install_dir` with `install_steps` stages a replacement for an external installation directory after a successful build. `{install_dir}` is substituted with a staging path before the old directory is replaced.
-`tracked_files` are hashed after every build. If they change upstream,
+When updatium has no install state (for example a build done manually), `check`
+reads the installed version from the tag checked out in `source_dir` and requires
+the configured install target to exist. `tracked_files` are hashed after every build. If they change upstream,
 the next update **stops before building** (`⚠ approval`) and snapshots both
 states. Review and clear with:
 
@@ -220,6 +222,8 @@ Exit codes: `0` success/no-op · `1` error · `2` completed-with-failures or
 pending approvals (script-friendly).
 
 Status markers: `● ok ▲ update ⚠ approval ✖ error · unchecked`.
+`LATEST` is the newest version in the current provider result; versions removed
+by a config filter (such as `tag_regex` or `ref_regex`) do not linger.
 
 TUI keys: `/` search · `f` cycle status filters · `r` refresh · `u` update selected · `U` bulk update eligible apps · `a` approve · `j/k/arrows/pgup/pgdn` navigate · `d` app history · `e` edit config in `$EDITOR` · `n` create app · `x` delete config only · `g/G` write/remove desktop entry · `p` plugins · `F1` help · `q` quit. Destructive actions ask for confirmation; app-config deletion retains installed files, desktop entry, and database history/state.
 `updatium tui --print-frame` renders one frame from DB state and exits — CI-safe.

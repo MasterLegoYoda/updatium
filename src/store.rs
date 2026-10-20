@@ -132,17 +132,39 @@ impl Store {
         Ok(rows)
     }
 
-    /// Record known versions (insert-or-ignore; first_seen preserved).
+    /// Synchronize an app's known versions with the current provider result:
+    /// insert unseen versions (first_seen preserved), then drop versions the
+    /// provider no longer advertises (e.g. filtered out by a tightened regex).
+    /// Returns the number of newly inserted versions.
     pub fn record_versions(&self, app: &str, versions: &[String]) -> Result<usize> {
-        let mut stmt = self.conn.prepare_cached(
-            "INSERT OR IGNORE INTO known_versions(app_id, version, first_seen)
-             VALUES(?1, ?2, ?3)",
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
         let mut added = 0;
         let ts = now();
-        for v in versions {
-            added += stmt.execute((app, v, &ts))?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO known_versions(app_id, version, first_seen)
+                 VALUES(?1, ?2, ?3)",
+            )?;
+            for v in versions {
+                added += stmt.execute((app, v, &ts))?;
+            }
         }
+
+        if versions.is_empty() {
+            tx.execute("DELETE FROM known_versions WHERE app_id = ?1", [app])?;
+        } else {
+            let placeholders = vec!["?"; versions.len()].join(",");
+            let sql = format!(
+                "DELETE FROM known_versions WHERE app_id = ?1 AND version NOT IN ({placeholders})"
+            );
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(versions.len() + 1);
+            params.push(&app);
+            for v in versions {
+                params.push(v);
+            }
+            tx.execute(&sql, params.as_slice())?;
+        }
+        tx.commit()?;
         Ok(added)
     }
 
@@ -314,13 +336,18 @@ mod tests {
             .record_versions("a", &["1.9".into(), "1.10".into()])
             .unwrap();
         assert_eq!(n, 2);
-        // Duplicate inserts ignored.
+        // Duplicate inserts ignored; versions no longer advertised are pruned.
         let n = s
             .record_versions("a", &["1.10".into(), "2.0".into()])
             .unwrap();
         assert_eq!(n, 1);
+        assert_eq!(s.known_versions("a").unwrap().len(), 2);
+        assert!(!s.known_versions("a").unwrap().contains(&"1.9".to_string()));
         assert_eq!(s.latest_known("a").unwrap(), Some("2.0".to_string()));
         assert_eq!(s.latest_known("ghost").unwrap(), None);
+
+        s.record_versions("a", &[]).unwrap();
+        assert!(s.known_versions("a").unwrap().is_empty());
     }
 
     #[test]

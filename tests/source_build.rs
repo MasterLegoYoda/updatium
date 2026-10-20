@@ -1,6 +1,7 @@
 //! source-build provider against a local git repository fixture.
+use std::io::Write as _;
 use std::path::Path;
-use std::process::Command as StdCommand;
+use std::process::{Command as StdCommand, Stdio};
 use updatium::config::{AppSource, SourceBuildCfg, SourceKind};
 use updatium::net;
 use updatium::provider::{Provider, source_build::SourceBuild};
@@ -63,6 +64,52 @@ async fn lists_and_filters_tags_from_local_repo() {
         "refs/tags/ stripped, regex applied"
     );
     assert!(rels.iter().all(|r| r.assets.is_empty()));
+}
+
+#[tokio::test]
+async fn matching_tags_beyond_exec_tail_cap_are_not_lost() {
+    let repo = make_repo();
+    // git ls-remote sorts refs: b1000/b2000 come before v*. Add enough
+    // later-sorting tags that the matching refs fall outside exec::run's
+    // 200-line tail (the llama.cpp case: >8000 tag refs).
+    let head = StdCommand::new("git")
+        .args(["-C", repo.path().to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout).unwrap();
+    let mut updates = String::new();
+    for i in 0..210 {
+        updates.push_str(&format!("create refs/tags/v9{i:04} {head}"));
+    }
+    let mut child = StdCommand::new("git")
+        .args(["-C", repo.path().to_str().unwrap(), "update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(updates.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+
+    let cfg = SourceBuildCfg {
+        repo_url: repo.path().to_string_lossy().into_owned(),
+        ref_regex: r"^refs/tags/b\d+$".into(),
+        api_base: None,
+        source_dir: None,
+        install_dir: None,
+        build: crate_build_cfg(),
+    };
+    let rels = SourceBuild
+        .check(&app(cfg), &net::build_client().unwrap())
+        .await
+        .unwrap();
+    let mut versions: Vec<&str> = rels.iter().map(|r| r.version.as_str()).collect();
+    versions.sort_unstable();
+    assert_eq!(versions, vec!["b1000", "b2000"]);
 }
 
 #[tokio::test]

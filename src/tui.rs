@@ -37,7 +37,7 @@ fn frame_rows(engine: &Engine) -> Vec<UiRow> {
     let apps = config::load_apps(&engine.home_paths().apps_d()).unwrap_or_default();
     apps.into_iter()
         .map(|app| {
-            let installed = engine.installed_version(&app.id).ok().flatten();
+            let installed = engine.installed_for(&app);
             let latest = engine.latest_known_pub(&app.id).ok().flatten();
             let status = if !app.enabled {
                 Status::Disabled
@@ -379,19 +379,18 @@ fn worker_refresh(
             let mut rows = Vec::with_capacity(apps.len());
             let mut row_error = None;
             for app in apps {
-                let installed = match engine.installed_version(&app.id) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        row_error = Some(error);
-                        None
-                    }
-                };
-                let latest = match engine.latest_known_pub(&app.id) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        row_error = Some(error);
-                        None
-                    }
+                let installed = engine.installed_for(&app);
+                // Prefer the just-computed check result. The DB's latest_known
+                // is only a fallback for apps that were not checked this round.
+                let latest = match reports.get(&app.id) {
+                    Some(report) => report.latest.clone(),
+                    None => match engine.latest_known_pub(&app.id) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            row_error = Some(error);
+                            None
+                        }
+                    },
                 };
                 let status = if !app.enabled {
                     Status::Disabled

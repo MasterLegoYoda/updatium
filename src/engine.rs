@@ -148,12 +148,7 @@ impl Engine {
         // Phase 2: sequential state writes + status computation.
         let mut reports = Vec::with_capacity(fetched.len());
         for (app, res) in fetched {
-            let installed = self
-                .store
-                .state(&app.id)
-                .ok()
-                .flatten()
-                .and_then(|s| s.installed_version);
+            let installed = self.installed_for(&app);
             let pending = self.is_pending_approval(&app.id).unwrap_or(false);
 
             match res {
@@ -182,23 +177,16 @@ impl Engine {
                         Some(&serde_json::json!({ "count": versions.len() }).to_string()),
                     );
 
-                    let latest = self.store.latest_known(&app.id).ok().flatten();
+                    // "Latest" is the newest version the provider advertises
+                    // right now, not the all-time maximum ever recorded: config
+                    // filters (tag_regex, prereleases, ref_regex) can remove a
+                    // previously seen version from the current result set.
+                    let latest = versions.first().cloned();
                     let status = if pending {
                         Status::NeedsApproval
                     } else {
                         match (&installed, &latest) {
-                            (_, None) => {
-                                if self
-                                    .store
-                                    .known_versions(&app.id)
-                                    .map(|v| v.is_empty())
-                                    .unwrap_or(true)
-                                {
-                                    Status::NeverChecked
-                                } else {
-                                    Status::Ok
-                                }
-                            }
+                            (_, None) => Status::NeverChecked,
                             (None, Some(_)) => Status::NeverChecked,
                             (Some(i), Some(l)) => match cmp_version(l, i) {
                                 std::cmp::Ordering::Greater => {
@@ -295,12 +283,7 @@ impl Engine {
         self.store
             .sync_apps(&[(app.id.as_str(), app.provider.as_str(), app.enabled)])?;
 
-        let from = self
-            .store
-            .state(id)
-            .ok()
-            .flatten()
-            .and_then(|s| s.installed_version);
+        let from = self.installed_for(&app);
 
         let mut releases = self
             .check_one_versions(&app)
@@ -1038,7 +1021,60 @@ impl Engine {
     // Introspection for CLI/TUI/tests
     // -----------------------------------------------------------------
 
+    /// Installed version for `app`: recorded install state wins, with a
+    /// source-build checkout fallback for builds done outside updatium.
+    pub fn installed_for(&self, app: &AppFile) -> Option<String> {
+        self.store
+            .state(&app.id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.installed_version)
+            .or_else(|| self.detect_source_build_version(app))
+    }
+
+    /// Derive the installed version of a source-build app from the tag checked
+    /// out in its `source_dir` (or managed `src/<id>` checkout) when an install
+    /// target exists. Detached HEADs without a matching tag yield None.
+    fn detect_source_build_version(&self, app: &AppFile) -> Option<String> {
+        let SourceKind::SourceBuild(sb) = &app.source_kind else {
+            return None;
+        };
+        let checkout = sb
+            .source_dir
+            .as_deref()
+            .map(crate::config::expand_tilde)
+            .unwrap_or_else(|| self.home.src().join(&app.id));
+        let installed_exists = match sb.install_dir.as_deref() {
+            Some(dir) => crate::config::expand_tilde(dir).exists(),
+            None => self.home.install_current(&app.id).exists(),
+        };
+        if !installed_exists || !checkout.join(".git").exists() {
+            return None;
+        }
+        let re = regex::Regex::new(&sb.ref_regex).ok()?;
+        let out = std::process::Command::new("git")
+            .args(["tag", "--points-at", "HEAD"])
+            .current_dir(&checkout)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut versions: Vec<String> = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty() && re.is_match(&format!("refs/tags/{tag}")))
+            .map(provider::version_from_tag)
+            .collect();
+        versions.sort_by(|a, b| cmp_version(a, b));
+        versions.pop()
+    }
+
     pub fn installed_version(&self, id: &str) -> Result<Option<String>> {
+        if let Some(app) = self.load_apps()?.into_iter().find(|a| a.id == id) {
+            return Ok(self.installed_for(&app));
+        }
         Ok(self.store.state(id)?.and_then(|s| s.installed_version))
     }
 
@@ -1056,14 +1092,22 @@ impl Engine {
 
     /// (id, provider, installed) rows for `updatium list` and the TUI frame.
     pub fn store_list(&self) -> Result<Vec<(String, String, Option<String>)>> {
+        let apps: std::collections::HashMap<String, AppFile> = self
+            .load_apps()?
+            .into_iter()
+            .map(|a| (a.id.clone(), a))
+            .collect();
         let mut out = Vec::new();
         for a in self.store.list_apps()? {
-            let installed = self
-                .store
-                .state(&a.id)
-                .ok()
-                .flatten()
-                .and_then(|s| s.installed_version);
+            let installed = match apps.get(&a.id) {
+                Some(app) => self.installed_for(app),
+                None => self
+                    .store
+                    .state(&a.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.installed_version),
+            };
             out.push((a.id, a.provider, installed));
         }
         Ok(out)
