@@ -148,6 +148,55 @@ type = "none"
 }
 
 #[tokio::test]
+async fn installed_version_cmd_detects_unmanaged_install() {
+    let (base, _guard) = common::spawn().await;
+    let home = tempfile::tempdir().unwrap();
+    write_app(
+        home.path(),
+        "demo",
+        &format!(
+            r#"
+id = "demo"
+provider = "github-releases"
+allow_insecure_http = true
+repo = "demo/app"
+api_base = "{base}/gh"
+installed_version_cmd = ["sh", "-c", "echo 2.0.0"]
+
+[install]
+type = "none"
+"#
+        ),
+    );
+    let e = engine(home.path());
+
+    // No DB state: the configured command supplies the installed version.
+    let reports = e.check(None).await.unwrap();
+    assert_eq!(reports[0].installed.as_deref(), Some("2.0.0"));
+    assert_eq!(reports[0].latest.as_deref(), Some("2.1.0"));
+    assert!(matches!(reports[0].status, Status::UpdateAvailable));
+    assert_eq!(
+        e.installed_version("demo").unwrap().as_deref(),
+        Some("2.0.0")
+    );
+
+    // Update only selects strictly newer releases, proving detection fed the
+    // normal update path rather than forcing a reinstall of the same version.
+    let rep = e
+        .update(
+            "demo",
+            &UpdateOpts {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(rep.from.as_deref(), Some("2.0.0"));
+    assert_eq!(rep.to.as_deref(), Some("2.1.0"));
+}
+
+#[tokio::test]
 async fn poisoned_digest_hard_stops_with_verify_failed_event() {
     let (base, _guard) = common::spawn().await;
     let home = tempfile::tempdir().unwrap();

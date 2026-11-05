@@ -1021,15 +1021,46 @@ impl Engine {
     // Introspection for CLI/TUI/tests
     // -----------------------------------------------------------------
 
-    /// Installed version for `app`: recorded install state wins, with a
-    /// source-build checkout fallback for builds done outside updatium.
+    /// Installed version for `app`: recorded install state wins, then an
+    /// optional user-provided detection command (for installs done outside
+    /// Updatium), then a source-build checkout fallback.
     pub fn installed_for(&self, app: &AppFile) -> Option<String> {
         self.store
             .state(&app.id)
             .ok()
             .flatten()
             .and_then(|s| s.installed_version)
+            .or_else(|| self.detect_installed_version_cmd(app))
             .or_else(|| self.detect_source_build_version(app))
+    }
+
+    /// Run the app's `installed_version_cmd` and take the first non-empty
+    /// stdout line as the installed version. Failures mean "unknown", never an
+    /// error: detection is best-effort and must not break check/list.
+    fn detect_installed_version_cmd(&self, app: &AppFile) -> Option<String> {
+        let argv = app.installed_version_cmd.as_ref()?;
+        let (program, args) = argv.split_first()?;
+        if program.trim().is_empty() {
+            return None;
+        }
+        let program = crate::config::expand_tilde(program);
+        let args: Vec<std::path::PathBuf> = args
+            .iter()
+            .map(|a| crate::config::expand_tilde(a))
+            .collect();
+        let out = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
     }
 
     /// Derive the installed version of a source-build app from the tag checked

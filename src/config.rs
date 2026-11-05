@@ -596,6 +596,9 @@ pub struct AppFile {
     pub enabled: bool,
     pub digest_policy: DigestPolicy,
     pub allow_insecure_http: bool,
+    /// Optional argv whose first non-empty stdout line is the version currently
+    /// installed outside Updatium's own state (adoption/detection fallback).
+    pub installed_version_cmd: Option<Vec<String>>,
     pub install: InstallCfg,
     pub source_kind: SourceKind,
 }
@@ -644,6 +647,8 @@ impl AppFile {
                 .unwrap_or_default();
         let allow_insecure_http =
             opt_field::<bool>(&mut table, "allow_insecure_http", path_for_errors)?.unwrap_or(false);
+        let installed_version_cmd =
+            opt_field::<Vec<String>>(&mut table, "installed_version_cmd", path_for_errors)?;
         let install =
             opt_field::<InstallCfg>(&mut table, "install", path_for_errors)?.unwrap_or_default();
 
@@ -692,6 +697,7 @@ impl AppFile {
             enabled,
             digest_policy,
             allow_insecure_http,
+            installed_version_cmd,
             install,
             source_kind,
         })
@@ -859,6 +865,26 @@ mod tests {
             other => panic!("wrong kind {other:?}"),
         }
         assert_eq!(app.install.kind, InstallType::Dir);
+    }
+
+    #[test]
+    fn installed_version_cmd_parses_as_common_key() {
+        let t = r#"
+            id = "llamacpp"
+            provider = "source-build"
+            repo_url = "https://github.com/ggml-org/llama.cpp"
+            ref_regex = '^refs/tags/b\d+$'
+            installed_version_cmd = ["sh", "-c", "llama-cli --version 2>&1 | sed -n 's/.*build \\([0-9]*\\).*/b\\1/p'"]
+            [build]
+            steps = [["true"]]
+            tracked_files = ["CMakeLists.txt"]
+            artifacts = []
+        "#;
+        let app = AppFile::parse(t, "apps.d/llamacpp.toml").unwrap();
+        let cmd = app.installed_version_cmd.as_ref().unwrap();
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-c");
+        assert!(cmd[2].contains("build"));
     }
 
     #[test]

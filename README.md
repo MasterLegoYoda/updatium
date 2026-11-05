@@ -83,6 +83,7 @@ repo_url = "https://github.com/ggml-org/llama.cpp"
 source_dir = "/home/noesis/Software/llamacpp/llama.cpp"
 install_dir = "/home/noesis/Software/llama.cpp"
 ref_regex = '^refs/tags/b\d+$'
+installed_version_cmd = ["sh", "-c", "~/Software/llama.cpp/llama-cli --version 2>&1 | sed -n 's/.*build \\([0-9]*\\).*/b\\1/p'"]
 
 [build]
 steps = [["cmake", "-B", "build", "-DGGML_CUDA=ON"], ["cmake", "--build", "build", "-j"]]
@@ -108,6 +109,24 @@ states. Review and clear with:
 updatium approve llamacpp --show-diff
 updatium update llamacpp
 ```
+
+### Adopting an install made outside Updatium
+
+If an app was installed manually (or by an older updatium run that has no state
+recorded), set `installed_version_cmd`. Its first non-empty stdout line is used
+as the installed version whenever the database has none; it runs on `list`,
+`check` and `update`. A failing command simply means "unknown".
+
+```toml
+# vllm.cpp ships a VERSION file (version=0.0.2)
+installed_version_cmd = ["sed", "-n", "s/^version=//p", "~/Software/vllm.cpp/VERSION"]
+
+# llama.cpp exposes its build number; map it to the `b<number>` tag form
+installed_version_cmd = ["sh", "-c", "~/Software/llama.cpp/llama-cli --version 2>&1 | sed -n 's/.*build \\([0-9]*\\).*/b\\1/p'"]
+```
+
+Once Updatium performs an update itself, the recorded install state wins and the
+command is no longer consulted.
 
 ## Runtime layout
 
@@ -145,7 +164,9 @@ errors.
 
 Common keys: `id`, `provider`, `enabled` (default true),
 `digest_policy` = `required | prefer | off` (default `prefer`),
-optional `allow_insecure_http` (permits plain http for this app), plus one
+optional `allow_insecure_http` (permits plain http for this app),
+optional `installed_version_cmd` (argv whose first non-empty stdout line is the
+currently installed version, for installs made outside Updatium), plus one
 provider block and an `[install]` table.
 
 ```toml
