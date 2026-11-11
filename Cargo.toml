@@ -17,7 +17,7 @@ futures = "0.3.34"
 hex = "0.4.3"
 ratatui = "0.30.2"
 regex = "1.13.1"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls", "socks"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }

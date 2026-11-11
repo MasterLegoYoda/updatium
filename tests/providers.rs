@@ -11,6 +11,7 @@ use updatium::provider::{Provider, Release};
 fn app(kind: SourceKind, insecure_http: bool) -> AppSource {
     AppSource {
         allow_insecure_http: insecure_http,
+        proxy: None,
         kind,
     }
 }

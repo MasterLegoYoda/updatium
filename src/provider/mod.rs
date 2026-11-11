@@ -165,18 +165,19 @@ struct PluginDescribe {
 
 impl ExternalProvider {
     /// Run one plugin invocation and return its stdout (Err on nonzero exit or timeout).
-    async fn invoke(&self, subcommand: &str, stdin_json: Option<&str>) -> Result<String> {
+    async fn invoke(&self, subcommand: &str, stdin_json: Option<&str>, proxy: Option<&str>) -> Result<String> {
         let argv = vec![
             self.path.to_string_lossy().into_owned(),
             subcommand.to_string(),
         ];
-        let out = crate::exec::run_with_stdin(
+        let out = crate::exec::run_with_stdin_proxy(
             &argv,
             None,
             std::time::Duration::from_secs(60),
             true,
             stdin_json.map(|s| s.as_bytes()),
             &[],
+            proxy,
         )
         .await?;
         anyhow::ensure!(
@@ -189,8 +190,8 @@ impl ExternalProvider {
         Ok(out.stdout_tail)
     }
 
-    async fn describe(&self) -> Result<()> {
-        let stdout = self.invoke("describe", None).await?;
+    async fn describe(&self, proxy: Option<&str>) -> Result<()> {
+        let stdout = self.invoke("describe", None, proxy).await?;
         let d: PluginDescribe = serde_json::from_str(stdout.trim())
             .with_context(|| format!("external provider {}: bad describe JSON", self.basename))?;
         if d.protocol != 1 && d.protocol != 2 {
@@ -227,13 +228,13 @@ impl ExternalProvider {
     async fn describe_cached(&self, app: &AppSource) -> Result<Vec<Release>> {
         // Validate the handshake once per instance per call site; cheap enough
         // to simply re-run for clarity in an MVP.
-        self.describe().await?;
+        self.describe(app.proxy.as_deref()).await?;
 
         let raw = match &app.kind {
             crate::config::SourceKind::External { raw, .. } => raw,
             _ => bail!("provider mismatch: external got another app kind"),
         };
-        let stdout = self.invoke("check", Some(&raw.to_string())).await?;
+        let stdout = self.invoke("check", Some(&raw.to_string()), app.proxy.as_deref()).await?;
         let parsed: PluginCheckOut = serde_json::from_str(stdout.trim())
             .with_context(|| format!("external provider {}: bad check JSON", self.basename))?;
         Ok(parsed.releases)

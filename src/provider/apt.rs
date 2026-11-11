@@ -21,11 +21,12 @@ impl Provider for Apt {
             SourceKind::Apt(c) => c.clone(),
             _ => bail!("provider mismatch: apt got another app kind"),
         };
-        let out = crate::exec::run(
+        let out = crate::exec::run_proxy(
             &["apt-cache".into(), "policy".into(), cfg.package.clone()],
             None,
             Duration::from_secs(120),
             true,
+            app.proxy.as_deref(),
         )
         .await
         .context("running apt-cache policy")?;

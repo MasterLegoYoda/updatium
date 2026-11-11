@@ -30,7 +30,7 @@ impl Provider for Flatpak {
         // Full stdout required: the whole remote listing (~3500 rows) exceeds
         // exec's 200-line capture tail, and flatpak 1.14 rejects app args on
         // `remote-ls`, so the app filter happens after capture.
-        let out = crate::exec::run_full(
+        let out = crate::exec::run_full_proxy(
             &[
                 "flatpak".into(),
                 "remote-ls".into(),
@@ -41,6 +41,7 @@ impl Provider for Flatpak {
             ],
             None,
             Duration::from_secs(120),
+            app.proxy.as_deref(),
         )
         .await
         .context("running flatpak remote-ls")?;

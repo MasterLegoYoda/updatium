@@ -10,6 +10,7 @@ use updatium::provider::docker_registry::DockerRegistry;
 fn app(kind: SourceKind) -> AppSource {
     AppSource {
         allow_insecure_http: true,
+        proxy: None,
         kind,
     }
 }

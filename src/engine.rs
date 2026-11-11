@@ -99,7 +99,7 @@ impl Engine {
         let store = Store::open(&home.db_path())?;
         let registry: std::collections::BTreeMap<_, _> =
             provider::registry(&global).into_iter().collect();
-        let http = net::build_client()?;
+        let http = net::build_client_with_proxy(global.proxy.as_deref())?;
         let installers = crate::installer::registry(&global);
         Ok(Engine {
             global,
@@ -113,6 +113,23 @@ impl Engine {
 
     fn load_apps(&self) -> Result<Vec<AppFile>> {
         config::load_apps(&self.home.apps_d())
+    }
+
+    fn app_proxy<'a>(&'a self, app: &'a AppFile) -> Option<&'a str> {
+        app.proxy.as_deref().or(self.global.proxy.as_deref())
+    }
+
+    fn app_http(&self, app: &AppFile) -> Result<reqwest::Client> {
+        match app.proxy.as_deref() {
+            Some(proxy) => net::build_client_with_proxy(Some(proxy)),
+            None => Ok(self.http.clone()),
+        }
+    }
+
+    fn app_source(&self, app: &AppFile) -> config::AppSource {
+        let mut source = app.app_source();
+        source.proxy = self.app_proxy(app).map(str::to_owned);
+        source
     }
 
     // -----------------------------------------------------------------
@@ -137,15 +154,14 @@ impl Engine {
         // Phase 1: concurrent provider checks.
         let fetched: Vec<(AppFile, Result<Vec<Release>>)> =
             futures::stream::iter(apps.into_iter().map(|app| {
-                let http = &self.http;
                 async move {
                     if !app.enabled {
                         return (app, Ok(Vec::new()));
                     }
-                    let src = app.app_source();
-                    let res = match provider::lookup_btree(&self.registry, &app.provider) {
-                        Ok(p) => p.check(&src, http).await,
-                        Err(e) => Err(e),
+                    let src = self.app_source(&app);
+                    let res = match (provider::lookup_btree(&self.registry, &app.provider), self.app_http(&app)) {
+                        (Ok(p), Ok(http)) => p.check(&src, &http).await,
+                        (Err(e), _) | (_, Err(e)) => Err(e),
                     };
                     (app, res)
                 }
@@ -383,7 +399,7 @@ impl Engine {
 
     async fn check_one_versions(&self, app: &AppFile) -> Result<Vec<Release>> {
         let p = provider::lookup_btree(&self.registry, &app.provider)?;
-        p.check(&app.app_source(), &self.http).await
+        p.check(&self.app_source(app), &self.app_http(app)?).await
     }
 
     fn describe_plan(&self, app: &AppFile, target: &Release, actions: &mut Vec<String>) {
@@ -557,8 +573,9 @@ impl Engine {
             allow_insecure_http: app.allow_insecure_http,
         };
         progress(UpdateProgress::Stage("Downloading"));
+        let http = self.app_http(app)?;
         let download_path = net::download_with_progress(
-            &self.http,
+            &http,
             &asset.url,
             &self.home.downloads(),
             &opts,
@@ -661,17 +678,18 @@ impl Engine {
     /// Clone (first time) or fetch an existing checkout, then detach onto the
     /// target tag. Tries the bare version first, then a `v`-prefixed tag.
     /// Fetch/update a configured checkout or the managed source root, then detach onto the target tag.
-    async fn checkout_source(&self, repo_url: &str, id: &str, version: &str, source_dir: Option<&str>) -> Result<PathBuf> {
+    async fn checkout_source(&self, repo_url: &str, id: &str, version: &str, source_dir: Option<&str>, proxy: Option<&str>) -> Result<PathBuf> {
         let dir = source_dir
             .map(crate::config::expand_tilde)
             .unwrap_or_else(|| self.home.src().join(id));
         let timeout = std::time::Duration::from_secs(300);
         if dir.join(".git").exists() {
-            let out = exec::run(
+            let out = exec::run_proxy(
                 &["git".into(), "fetch".into(), "--tags".into(), "--force".into()],
                 Some(&dir),
                 timeout,
                 true,
+                proxy,
             )
             .await?;
             anyhow::ensure!(out.status, "git fetch failed:\n{}", out.stderr_tail);
@@ -682,7 +700,7 @@ impl Engine {
             if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let out = exec::run(
+            let out = exec::run_proxy(
                 &[
                     "git".into(),
                     "clone".into(),
@@ -693,16 +711,18 @@ impl Engine {
                 None,
                 timeout,
                 true,
+                proxy,
             )
             .await?;
             anyhow::ensure!(out.status, "git clone failed:\n{}", out.stderr_tail);
         }
         for tag in [version.to_string(), format!("v{version}")] {
-            let out = exec::run(
+            let out = exec::run_proxy(
                 &["git".into(), "checkout".into(), "--detach".into(), tag],
                 Some(&dir),
                 timeout,
                 true,
+                proxy,
             )
             .await?;
             if out.status {
@@ -724,7 +744,7 @@ impl Engine {
         // Step 5: checkout + integrity gate.
         progress(UpdateProgress::Stage("Fetching and checking out source"));
         let checkout = self
-            .checkout_source(&sb.repo_url, &app.id, &target.version, sb.source_dir.as_deref())
+            .checkout_source(&sb.repo_url, &app.id, &target.version, sb.source_dir.as_deref(), self.app_proxy(app))
             .await?;
         rep.actions.push(format!("checked out {}", target.version));
         progress(UpdateProgress::Stage("Checking build scripts"));
@@ -774,7 +794,7 @@ impl Engine {
         progress(UpdateProgress::Stage("Building"));
         let timeout = std::time::Duration::from_secs(sb.build.timeout_secs);
         for (i, step) in sb.build.steps.iter().enumerate() {
-            let out = exec::run_env(step, Some(&checkout), timeout, &sb.build.env, true)
+            let out = exec::run_env_proxy(step, Some(&checkout), timeout, &sb.build.env, true, self.app_proxy(app))
                 .await
                 .with_context(|| {
                     format!("build step {} ({}) failed to start", i + 1, step.join(" "))
@@ -807,7 +827,7 @@ impl Engine {
             vars.insert("install_dir", staging_text.as_str());
             for (i, step) in sb.build.install_steps.iter().enumerate() {
                 let command = exec::substitute(step, &vars)?;
-                let out = exec::run_env(&command, Some(&checkout), timeout, &sb.build.env, true)
+                let out = exec::run_env_proxy(&command, Some(&checkout), timeout, &sb.build.env, true, self.app_proxy(app))
                     .await
                     .with_context(|| format!("install step {} ({}) failed to start", i + 1, command.join(" ")))?;
                 anyhow::ensure!(
@@ -966,11 +986,12 @@ impl Engine {
         detail: &serde_json::Value,
         rep: &mut UpdateReport,
     ) -> Result<()> {
-        let out = exec::run(
+        let out = exec::run_proxy(
             argv,
             None,
             std::time::Duration::from_secs(self.global.download_timeout_secs.max(600)),
             true,
+            self.app_proxy(app),
         )
         .await?;
         anyhow::ensure!(out.status, "apply_cmd failed:\n{}", out.stderr_tail);
@@ -1038,11 +1059,12 @@ impl Engine {
             ("repo", repo.as_str()),
         ]);
         let pull = exec::substitute(&cfg.pull_cmd, &vars)?;
-        let out = exec::run(
+        let out = exec::run_proxy(
             &pull,
             None,
             std::time::Duration::from_secs(self.global.download_timeout_secs.max(600)),
             true,
+            self.app_proxy(app),
         )
         .await?;
         anyhow::ensure!(out.status, "pull_cmd failed:\n{}", out.stderr_tail);
@@ -1050,7 +1072,7 @@ impl Engine {
 
         if let Some(rd) = &cfg.redeploy_cmd {
             let rd_argv = exec::substitute(rd, &vars)?;
-            let out = exec::run(&rd_argv, None, std::time::Duration::from_secs(600), true).await?;
+            let out = exec::run_proxy(&rd_argv, None, std::time::Duration::from_secs(600), true, self.app_proxy(app)).await?;
             anyhow::ensure!(out.status, "redeploy_cmd failed:\n{}", out.stderr_tail);
             rep.actions
                 .push(format!("redeployed via {}", rd_argv.join(" ")));

@@ -9,6 +9,7 @@ use updatium::provider::{Provider, source_build::SourceBuild};
 fn app(cfg: SourceBuildCfg) -> AppSource {
     AppSource {
         allow_insecure_http: false,
+        proxy: None,
         kind: SourceKind::SourceBuild(cfg),
     }
 }

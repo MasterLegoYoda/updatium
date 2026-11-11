@@ -42,6 +42,7 @@ async fn stub_provider_round_trips_config() {
     let raw = serde_json::json!({ "version": "9.9.9" });
     let src = updatium::config::AppSource {
         allow_insecure_http: false,
+        proxy: None,
         kind: SourceKind::External {
             id: "stub".into(),
             raw,
@@ -59,6 +60,32 @@ async fn stub_provider_round_trips_config() {
     assert_eq!(rels[0].assets[0].digest_hex(), Some(&"a".repeat(64)[..]));
 }
 
+#[tokio::test]
+async fn proxy_reaches_describe_and_check() {
+    let home = tempfile::tempdir().unwrap();
+    let g = home_with_providers(home.path());
+    write_stub(&g.home.providers_d(), "proxy", r##"#!/bin/sh
+for key in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do
+  eval "value=\$$key"
+  [ "$value" = "http://proxy.example:8080" ] || exit 1
+done
+[ -z "${no_proxy+x}" ] && [ -z "${NO_PROXY+x}" ] || exit 2
+case "$1" in
+  describe) echo '{"protocol":1,"id":"proxy"}' ;;
+  check) echo '{"releases":[]}' ;;
+  *) exit 3 ;;
+esac
+"##);
+    let reg = registry(&g);
+    let prov = registry_lookup_ok(&reg, "external:proxy");
+    let src = updatium::config::AppSource {
+        allow_insecure_http: false,
+        proxy: Some("http://proxy.example:8080".into()),
+        kind: SourceKind::External { id: "proxy".into(), raw: serde_json::json!({}) },
+    };
+    assert!(prov.check(&src, &net::build_client().unwrap()).await.unwrap().is_empty());
+}
+
 const STUB_BAD_PROTOCOL: &str = r#"#!/usr/bin/env bash
 echo '{"protocol":3,"id":"future"}'
 "#;
@@ -73,6 +100,7 @@ async fn wrong_protocol_version_is_rejected() {
     let prov = registry_lookup_ok(&reg, "external:future");
     let src = updatium::config::AppSource {
         allow_insecure_http: false,
+        proxy: None,
         kind: SourceKind::External {
             id: "future".into(),
             raw: serde_json::Value::Object(Default::default()),
@@ -100,6 +128,7 @@ async fn nonzero_exit_surfaces_stderr() {
     let prov = registry_lookup_ok(&reg, "external:broken");
     let src = updatium::config::AppSource {
         allow_insecure_http: false,
+        proxy: None,
         kind: SourceKind::External {
             id: "broken".into(),
             raw: serde_json::Value::Object(Default::default()),

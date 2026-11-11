@@ -150,6 +150,7 @@ max_parallel_checks = 4          # concurrent provider checks (default 4)
 download_timeout_secs = 600      # per-download deadline (default 600)
 max_download_mb = 2048           # hard mid-stream cap (default 2048)
 notify_cmd = []                  # argv; JSON summary piped to stdin; empty = off
+# proxy = "http://127.0.0.1:3128"  # optional; applies to all apps
 
 [github]
 token_cmd = []                   # argv whose stdout line 1 is a PAT;
@@ -168,6 +169,28 @@ optional `allow_insecure_http` (permits plain http for this app),
 optional `installed_version_cmd` (argv whose first non-empty stdout line is the
 currently installed version, for installs made outside Updatium), plus one
 provider block and an `[install]` table.
+
+Set `proxy` in an app file to override the global proxy for that app's provider
+checks and downloads:
+
+```toml
+id = "example"
+provider = "html-links"
+url = "https://example.com/downloads/"
+link_regex = 'href="(?P<href>[^"]+\.AppImage)"'
+version_capture = '(?P<version>\d+\.\d+)'
+proxy = "socks5h://127.0.0.1:1080"
+```
+
+Proxy URLs support `http://`, `https://`, `socks5://` and `socks5h://` (SOCKS5
+with proxy-side DNS), including optional `user:password@` credentials. Protect
+config files containing credentials. Explicit proxy settings apply to both HTTP
+and HTTPS destinations and override inherited proxy and `no_proxy` settings.
+Without a configured proxy, Updatium's built-in HTTP client connects directly;
+subprocesses retain their inherited environment. Provider, git, build and apply
+subprocesses receive standard proxy environment variables, but each external
+program or daemon must support and honor them independently (for example, a
+Docker daemon may require its own proxy configuration).
 
 ```toml
 [install]

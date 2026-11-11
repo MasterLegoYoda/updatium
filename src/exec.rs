@@ -163,6 +163,51 @@ pub async fn run_env(
     run_impl(cmd, cwd, timeout, capture, None, &env_pairs, Some(TAIL_LINES)).await
 }
 
+/// Execute with an explicit proxy, overriding inherited proxy and bypass settings.
+pub async fn run_proxy(
+    cmd: &[String], cwd: Option<&Path>, timeout: Duration, capture: bool, proxy: Option<&str>,
+) -> Result<RunOut> {
+    run_impl_proxy(cmd, cwd, timeout, capture, None, &[], Some(TAIL_LINES), proxy).await
+}
+
+/// Like [`run_proxy`], retaining complete stdout and stderr.
+pub async fn run_full_proxy(
+    cmd: &[String], cwd: Option<&Path>, timeout: Duration, proxy: Option<&str>,
+) -> Result<RunOut> {
+    run_impl_proxy(cmd, cwd, timeout, true, None, &[], None, proxy).await
+}
+
+/// Like [`run_with_stdin`], with an explicit proxy taking precedence over `env`.
+pub async fn run_with_stdin_proxy(
+    cmd: &[String], cwd: Option<&Path>, timeout: Duration, capture: bool,
+    stdin_bytes: Option<&[u8]>, env: &[(&str, &str)], proxy: Option<&str>,
+) -> Result<RunOut> {
+    let env_pairs: Vec<(String, String)> =
+        env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    run_impl_proxy(cmd, cwd, timeout, capture, stdin_bytes, &env_pairs, Some(TAIL_LINES), proxy).await
+}
+
+/// Like [`run_env`], with an explicit proxy taking precedence over `env`.
+pub async fn run_env_proxy(
+    cmd: &[String], cwd: Option<&Path>, timeout: Duration,
+    env: &std::collections::BTreeMap<String, String>, capture: bool, proxy: Option<&str>,
+) -> Result<RunOut> {
+    let env_pairs: Vec<(String, String)> =
+        env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    run_impl_proxy(cmd, cwd, timeout, capture, None, &env_pairs, Some(TAIL_LINES), proxy).await
+}
+
+/// Apply a configured proxy to a subprocess without modifying the parent environment.
+pub fn configure_proxy(command: &mut tokio::process::Command, proxy: Option<&str>) {
+    if let Some(proxy) = proxy {
+        for key in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            command.env(key, proxy);
+        }
+        command.env_remove("no_proxy");
+        command.env_remove("NO_PROXY");
+    }
+}
+
 async fn run_impl(
     cmd: &[String],
     cwd: Option<&Path>,
@@ -171,6 +216,19 @@ async fn run_impl(
     stdin_bytes: Option<&[u8]>,
     env: &[(String, String)],
     tail_lines: Option<usize>,
+) -> Result<RunOut> {
+    run_impl_proxy(cmd, cwd, timeout, capture, stdin_bytes, env, tail_lines, None).await
+}
+
+async fn run_impl_proxy(
+    cmd: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    capture: bool,
+    stdin_bytes: Option<&[u8]>,
+    env: &[(String, String)],
+    tail_lines: Option<usize>,
+    proxy: Option<&str>,
 ) -> Result<RunOut> {
     if cmd.is_empty() {
         bail!("refusing to execute empty command");
@@ -196,6 +254,7 @@ async fn run_impl(
     for (k, v) in env {
         command.env(k, v);
     }
+    configure_proxy(&mut command, proxy);
 
     let mut child = command
         .spawn()
@@ -274,6 +333,33 @@ mod tests {
 
     fn vars<'a>(pairs: &[(&'a str, &'a str)]) -> BTreeMap<&'a str, &'a str> {
         pairs.iter().copied().collect()
+    }
+
+    #[tokio::test]
+    async fn explicit_proxy_overrides_environment_and_bypass() {
+        let cmd = vec!["sh".into(), "-c".into(),
+            "printf '%s\\n' \"$http_proxy\" \"$https_proxy\" \"$all_proxy\" \"$HTTP_PROXY\" \"$HTTPS_PROXY\" \"$ALL_PROXY\" \"${no_proxy-unset}\" \"${NO_PROXY-unset}\"".into()];
+        let env = BTreeMap::from([
+            ("http_proxy".into(), "http://old:1".into()),
+            ("no_proxy".into(), "*".into()),
+            ("NO_PROXY".into(), "*".into()),
+        ]);
+        let out = run_env_proxy(&cmd, None, Duration::from_secs(5), &env, true, Some("http://proxy:8080"))
+            .await.unwrap();
+        assert!(out.status);
+        assert_eq!(out.stdout_tail, "http://proxy:8080\nhttp://proxy:8080\nhttp://proxy:8080\nhttp://proxy:8080\nhttp://proxy:8080\nhttp://proxy:8080\nunset\nunset");
+    }
+
+    #[tokio::test]
+    async fn absent_proxy_preserves_environment_overlay() {
+        let cmd = vec!["sh".into(), "-c".into(), "printf '%s %s' \"$http_proxy\" \"$NO_PROXY\"".into()];
+        let env = BTreeMap::from([
+            ("http_proxy".into(), "http://existing:1".into()),
+            ("NO_PROXY".into(), "*".into()),
+        ]);
+        let out = run_env_proxy(&cmd, None, Duration::from_secs(5), &env, true, None).await.unwrap();
+        assert!(out.status);
+        assert_eq!(out.stdout_tail, "http://existing:1 *");
     }
 
     #[test]

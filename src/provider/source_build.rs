@@ -29,7 +29,7 @@ impl Provider for SourceBuild {
         // Full stdout is required: large repos (llama.cpp has >8000 tag refs)
         // exceed exec's 200-line capture tail, and the matching tags may all
         // sit before that tail (e.g. `b1234` tags sort before the `v*` tags).
-        let out = crate::exec::run_full(
+        let out = crate::exec::run_full_proxy(
             &[
                 "git".to_string(),
                 "ls-remote".to_string(),
@@ -38,6 +38,7 @@ impl Provider for SourceBuild {
             ],
             None,
             Duration::from_secs(120),
+            app.proxy.as_deref(),
         )
         .await
         .context("running git ls-remote --tags")?;
@@ -83,6 +84,7 @@ impl Provider for SourceBuild {
                     .check(
                         &AppSource {
                             allow_insecure_http: app.allow_insecure_http,
+                            proxy: app.proxy.clone(),
                             kind: SourceKind::GithubReleases(gh_cfg),
                         },
                         http,

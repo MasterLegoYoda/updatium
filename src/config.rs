@@ -196,6 +196,9 @@ pub struct GlobalConfig {
     pub download_timeout_secs: u64,
     #[serde(default = "d_max_download_mb")]
     pub max_download_mb: u64,
+    /// Proxy URL for network operations unless overridden by an app.
+    #[serde(default)]
+    pub proxy: Option<String>,
     #[serde(default)]
     pub github: GithubGlobalCfg,
     /// Resolved runtime paths, injected by the engine after HomePaths::resolve.
@@ -582,6 +585,8 @@ pub enum SourceKind {
 #[derive(Debug, Clone)]
 pub struct AppSource {
     pub allow_insecure_http: bool,
+    /// Effective configured proxy for provider subprocesses.
+    pub proxy: Option<String>,
     pub kind: SourceKind,
 }
 
@@ -596,6 +601,7 @@ pub struct AppFile {
     pub enabled: bool,
     pub digest_policy: DigestPolicy,
     pub allow_insecure_http: bool,
+    pub proxy: Option<String>,
     /// Optional argv whose first non-empty stdout line is the version currently
     /// installed outside Updatium's own state (adoption/detection fallback).
     pub installed_version_cmd: Option<Vec<String>>,
@@ -608,6 +614,7 @@ impl AppFile {
     pub fn app_source(&self) -> AppSource {
         AppSource {
             allow_insecure_http: self.allow_insecure_http,
+            proxy: self.proxy.clone(),
             kind: self.source_kind.clone(),
         }
     }
@@ -647,6 +654,7 @@ impl AppFile {
                 .unwrap_or_default();
         let allow_insecure_http =
             opt_field::<bool>(&mut table, "allow_insecure_http", path_for_errors)?.unwrap_or(false);
+        let proxy = opt_field::<String>(&mut table, "proxy", path_for_errors)?;
         let installed_version_cmd =
             opt_field::<Vec<String>>(&mut table, "installed_version_cmd", path_for_errors)?;
         let install =
@@ -697,6 +705,7 @@ impl AppFile {
             enabled,
             digest_policy,
             allow_insecure_http,
+            proxy,
             installed_version_cmd,
             install,
             source_kind,

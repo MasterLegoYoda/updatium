@@ -6,14 +6,30 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Build the process-wide reqwest client. rustls-only, no default features.
+/// Build the default HTTP client.
 pub fn build_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    build_client_with_proxy(None)
+}
+
+/// Build a client using an explicit proxy for both HTTP and HTTPS requests.
+pub fn build_client_with_proxy(proxy: Option<&str>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .user_agent(concat!("updatium/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(30))
-        // Per-request timeouts are applied at the call site (download vs check).
-        .build()
-        .context("building HTTP client")
+        .connect_timeout(Duration::from_secs(30));
+    if let Some(proxy) = proxy {
+        let url = url::Url::parse(proxy).map_err(|_| anyhow::anyhow!("invalid proxy URL"))?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+                && url.host_str().is_some()
+                && (url.port_or_known_default().is_some() || matches!(url.scheme(), "socks5" | "socks5h"))
+                && matches!(url.path(), "" | "/")
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "proxy must be an http, https, socks5 or socks5h URL with a host and port"
+        );
+        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|_| anyhow::anyhow!("invalid proxy URL"))?);
+    }
+    builder.build().context("building HTTP client")
 }
 
 #[derive(Debug, Clone)]

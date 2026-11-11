@@ -21,7 +21,7 @@ impl Provider for Command {
             SourceKind::Command(c) => c.clone(),
             _ => bail!("provider mismatch: command got another app kind"),
         };
-        let out = crate::exec::run(&cfg.check_cmd, None, Duration::from_secs(120), true)
+        let out = crate::exec::run_proxy(&cfg.check_cmd, None, Duration::from_secs(120), true, app.proxy.as_deref())
             .await
             .context("running check_cmd")?;
         anyhow::ensure!(
