@@ -2,7 +2,7 @@
 //! worker thread; `--print-frame` remains a network-free DB/config snapshot.
 
 use crate::config::{self, HomePaths};
-use crate::engine::{Engine, Status, UpdateProgress};
+use crate::engine::{Engine, InstalledSource, Status, UpdateProgress};
 use anyhow::{Context as _, Result, bail};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -37,14 +37,16 @@ fn frame_rows(engine: &Engine) -> Vec<UiRow> {
     let apps = config::load_apps(&engine.home_paths().apps_d()).unwrap_or_default();
     apps.into_iter()
         .map(|app| {
-            let installed = engine.installed_for(&app);
+            let installed = engine.installed_info(&app);
             let latest = engine.latest_known_pub(&app.id).ok().flatten();
             let status = if !app.enabled {
                 Status::Disabled
+            } else if let Ok(Some(version)) = engine.pending_update(&app.id) {
+                Status::Error(format!("update to {version} incomplete or running"))
             } else if engine.is_pending_approval(&app.id).unwrap_or(false) {
                 Status::NeedsApproval
             } else {
-                status_from_versions(installed.as_deref(), latest.as_deref())
+                status_from_versions(installed.version.as_deref(), latest.as_deref())
             };
             let (config_path, config_issue) = match app_config_path_in(engine, &app.id) {
                 Ok(path) => (Some(path), None),
@@ -54,7 +56,8 @@ fn frame_rows(engine: &Engine) -> Vec<UiRow> {
                 app: app.id,
                 provider: app.provider,
                 enabled: app.enabled,
-                installed,
+                installed: installed.version,
+                installed_source: installed.source,
                 latest,
                 status,
                 config_path,
@@ -122,6 +125,7 @@ struct UiRow {
     provider: String,
     enabled: bool,
     installed: Option<String>,
+    installed_source: InstalledSource,
     latest: Option<String>,
     status: Status,
     config_path: Option<PathBuf>,
@@ -393,10 +397,19 @@ fn format_bytes(bytes: u64) -> String {
 
 fn update_result(id: &str, result: Result<crate::engine::UpdateReport>) -> String {
     match result {
-        Ok(report) => report.failed.map_or_else(
-            || format!("{} updated", report.app),
-            |error| format!("{} update failed: {error}", report.app),
-        ),
+        Ok(report) => {
+            if let Some(error) = report.failed {
+                format!("{} update failed: {error}", report.app)
+            } else if !report.integration_failures.is_empty() {
+                format!("{} installed; integration failed: {}", report.app, report.integration_failures.join("; "))
+            } else if report.track_only {
+                format!("{} observed update (track-only; not installed)", report.app)
+            } else if report.installed {
+                format!("{} updated", report.app)
+            } else {
+                format!("{}: nothing installed", report.app)
+            }
+        }
         Err(error) => format!("update {id} failed: {error:#}"),
     }
 }
@@ -425,7 +438,13 @@ fn worker_refresh(
             let mut rows = Vec::with_capacity(apps.len());
             let mut row_error = None;
             for app in apps {
-                let installed = engine.installed_for(&app);
+                let (installed, installed_source) = match reports.get(&app.id) {
+                    Some(report) => (report.installed.clone(), report.installed_source),
+                    None => {
+                        let info = engine.installed_info(&app);
+                        (info.version, info.source)
+                    }
+                };
                 // Prefer the just-computed check result. The DB's latest_known
                 // is only a fallback for apps that were not checked this round.
                 let latest = match reports.get(&app.id) {
@@ -464,6 +483,7 @@ fn worker_refresh(
                     provider: app.provider,
                     enabled: app.enabled,
                     installed,
+                    installed_source,
                     latest,
                     status,
                     config_path,
@@ -1300,7 +1320,7 @@ fn draw_app_screen(f: &mut Frame, area: Rect, ui: &UiState, visible: &[usize]) {
             Row::new([
                 Cell::from(format!("{} {}", if ui.marked.contains(&row.app) { "[x]" } else { "[ ]" }, row.app)),
                 Cell::from(row.provider.clone()),
-                Cell::from(row.installed.as_deref().unwrap_or("—").to_string()),
+                Cell::from(crate::cli::format_installed(row.installed.as_deref(), row.installed_source)),
                 Cell::from(row.latest.as_deref().unwrap_or("—").to_string()),
                 Cell::from(label).style(status_style(&row.status)),
             ])
@@ -1359,6 +1379,10 @@ fn render_detail(
             Style::default().add_modifier(Modifier::BOLD),
         ));
         lines.push(Line::from(format!("status: {}", row.status.label())));
+        lines.push(Line::from(format!(
+            "installed: {}",
+            crate::cli::format_installed(row.installed.as_deref(), row.installed_source)
+        )));
         lines.push(Line::from(format!(
             "config: {}",
             row.config_path
@@ -1557,6 +1581,7 @@ mod tests {
             provider: provider.into(),
             enabled: true,
             installed: None,
+            installed_source: InstalledSource::Unknown,
             latest: None,
             status,
             config_path: None,

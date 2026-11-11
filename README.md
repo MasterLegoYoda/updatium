@@ -13,9 +13,11 @@ heterogeneous channels:
 | apt repositories | `apt` | htop (track-only, or apply via sudo) |
 | Flatpak remotes | `flatpak` | Firefox on Flathub |
 
-Provider-based architecture: new sources plug in without touching the core.
-First version ships **CLI + TUI**; the engine is a reusable library so a future
-GUI needs no engine changes.
+Providers discover releases; installers publish the selected artifacts. External
+providers and installer plugins use the same engine lifecycle as their builtin
+counterparts. Builtin command, package-manager, Docker, and source-build flows
+still have explicit engine dispatch because their apply operations differ.
+The engine is also a reusable library.
 
 ## Build & install
 
@@ -99,9 +101,75 @@ link_bins = ["llama-cli", "llama-server"]
 ```
 
 `source_dir` reuses an existing checkout, and `install_dir` with `install_steps` stages a replacement for an external installation directory after a successful build. `{install_dir}` is substituted with a staging path before the old directory is replaced.
-When updatium has no install state (for example a build done manually), `check`
-reads the installed version from the tag checked out in `source_dir` and requires
-the configured install target to exist. `tracked_files` are hashed after every build. If they change upstream,
+
+Archive and source-build publication match artifact paths before copying them;
+artifact contents are not retained in memory for selection. Tracked build
+scripts are read separately for integrity hashing and review snapshots.
+ZIP and tar files retain their stored Unix permission bits when extracted and
+published, including executable bits.
+
+Managed archive/source directories and external `install_dir` replacements use
+an atomic directory exchange on Linux. Before the exchange, the previous
+installation remains active; after it, the new installation is active and the
+previous one remains in a sibling `.updatium-staging-*` directory until cleanup.
+An interrupted process needs no rollback to keep an installation available.
+Archive extraction and publication use independently owned staging directories;
+normal completion removes them, but a crash can leave them behind. Older
+`.staging-*` directories are not automatically removed. Before removing any
+abandoned stage, confirm that no process is using it and inspect its contents;
+an exchanged stage may contain the previous installation. If the filesystem does
+not support atomic exchange, replacement fails without removing the existing
+installation. AppImage replacement at the same filename uses an atomic file
+rename, but does not retain the old file for rollback after success; a changed
+filename leaves the old file in place. Command, apt, Flatpak, and Docker apply
+operations, external installer plugins, and source-build install commands control
+their own side effects; Updatium cannot roll those effects back. Source-build
+`install_dir` publication is protected only after those commands finish staging.
+
+These guarantees cover process interruption, not power-loss durability. Before
+running an update, Updatium records a pending operation; after the file cutover
+it records the installed version and `install_ok` together in one database
+transaction, before attempting desktop or symlink integration. A crash between
+cutover and that transaction can leave the recorded version stale; a crash
+afterward can leave integration incomplete. On the next `list` or `check`, the
+pending update is reported as incomplete or still running. A normal `update`
+refuses to guess what happened. Inspect the actual installation and history,
+then use `updatium update <id> --force` to retry the current latest release;
+the marker clears after the retry completes. Retrying user-supplied commands or
+external plugins can repeat side effects, so inspect those before forcing.
+
+Updates and approvals for the same app ID under the same Updatium home use a
+nonblocking per-app lock; a concurrent operation is refused. This protects the
+managed checkout, staging, download use, and installed-state writes of those
+operations. Download caches are isolated by app ID. Locks are advisory and do
+not protect files from unrelated programs, different Updatium homes, or different
+app IDs configured to share a checkout or installation target. Avoid sharing
+those paths across concurrently updated apps.
+
+Cancelling a running Updatium command future kills its direct child, but a
+process crash or forced termination can leave commands, plugins, or their
+descendants running after Updatium's lock is released. Before forcing a retry or
+removing staging, partial downloads, or an incomplete source checkout, inspect
+for and stop any surviving work; preserve local checkout changes. An interrupted
+clone may leave a non-git directory that must be inspected and moved or removed
+manually before retrying. Never delete lock files to stop a running operation.
+
+The installer or apply operation completing is reported as `installed`; the
+version and `install_ok` event are then committed together (`recorded` in JSON).
+If that commit fails, the installation is retained and the pending marker
+requires inspection and a forced retry. Desktop entries and binary symlinks are
+separate integration work: failures leave the installed files and recorded
+version in place, emit `integration_failed` events, and return exit code 2.
+Update JSON reports contain `installed`, `recorded`, and `integration_failures`;
+the latter also reports post-install bookkeeping errors. `failed` describes an
+installation failure, not a rollback. To retry integration after fixing its
+cause, use `--force`, which reruns the installer as well. Warnings unrelated to
+integration do not by themselves change the exit code.
+
+When Updatium has no recorded install, it can infer a source-build version from
+the checkout tag if the configured install target exists. A checkout is not
+proof that the installed binaries match it. `tracked_files` are hashed after
+every build. If they change upstream,
 the next update **stops before building** (`⚠ approval`) and snapshots both
 states. Review and clear with:
 
@@ -112,10 +180,13 @@ updatium update llamacpp
 
 ### Adopting an install made outside Updatium
 
-If an app was installed manually (or by an older updatium run that has no state
-recorded), set `installed_version_cmd`. Its first non-empty stdout line is used
-as the installed version whenever the database has none; it runs on `list`,
-`check` and `update`. A failing command simply means "unknown".
+Set `installed_version_cmd` to observe installations managed inside or outside
+Updatium. Its first non-empty stdout line is authoritative on every `list`,
+`check`, update selection, and dashboard refresh, even after a successful
+Updatium update. Empty output, a nonzero exit, or a failure to start means the
+installed version is unknown; Updatium does not silently use an older record.
+An update with an unknown configured probe is refused unless `--force` is used
+after inspection; track-only updates and dry runs do not apply an installation.
 
 ```toml
 # vllm.cpp ships a VERSION file (version=0.0.2)
@@ -125,8 +196,34 @@ installed_version_cmd = ["sed", "-n", "s/^version=//p", "~/Software/vllm.cpp/VER
 installed_version_cmd = ["sh", "-c", "~/Software/llama.cpp/llama-cli --version 2>&1 | sed -n 's/.*build \\([0-9]*\\).*/b\\1/p'"]
 ```
 
-Once Updatium performs an update itself, the recorded install state wins and the
-command is no longer consulted.
+Version provenance is shown as **observed** (successful configured probe),
+**inferred** (source checkout tag and an existing install target), **recorded**
+(last successful Updatium installation, not independently verified), or
+**unknown**. `list` and `check` JSON expose `installed_source`. Observations
+are not persisted over the installation record: removing the probe exposes the
+last recorded installation, not the last observation.
+
+For new managed directory, external source-directory, and AppImage installs,
+Updatium records the installation path and reports unknown if that file or
+directory is missing. Legacy managed directories can also be checked, but older
+AppImage records may lack a known path. Existence alone cannot detect changed
+contents, out-of-band upgrades or downgrades; configure a probe for those and
+for package managers, plugins, and command-driven installs. A source checkout may
+change without changing installed files, so its tag is only an inference and
+never overrides a recorded version.
+
+Probes are run afresh on reads, once per app per check/dashboard refresh; they
+are not cached or timed out. Slow commands or commands that access the network
+will delay these operations. Source-checkout inference runs a local `git tag`
+command when needed. Choose fast, side-effect-free probes.
+
+Track-only updates (`command`, `apt`, or `flatpak` without `apply_cmd`, and
+external providers with `install.type = "none"`) observe the selected release
+without changing installed state or running an installation. An existing
+`installed_version_cmd` remains effective, and a newer release remains an
+outstanding update. Update reports identify these runs as track-only; JSON
+reports set `track_only` to `true`, and `to` is the observed target, not a
+claim that it was installed. A track-only update exits successfully.
 
 ## Runtime layout
 
@@ -269,6 +366,17 @@ Status markers: `● ok ▲ update ⚠ approval ✖ error · unchecked`.
 `LATEST` is the newest version in the current provider result; versions removed
 by a config filter (such as `tag_regex` or `ref_regex`) do not linger.
 
+Version selection uses SemVer precedence for three-component SemVer versions,
+including tags prefixed with `v` or `V`; build metadata does not change
+precedence. Two-component numeric versions are compared with a zero patch;
+numeric cores with leading zeros are normalized, so date-like versions such as
+`2024.06.12` work too. The original tag is retained for fetching and applying
+releases. Other versions, including tags such as `b1234`, sort naturally
+within a separate class below all supported SemVer-like versions. Mixing these
+classes can therefore produce surprising results; use a provider filter to
+keep one version format where possible. Natural ordering is not a substitute
+for package-manager-specific version rules (including apt and Flatpak).
+
 TUI keys: `/` search · `f` cycle status filters · `r` refresh · `u` update the highlighted app · `U` bulk update eligible apps · `Space` toggle a mark · `s` update marked apps · `c` clear all marks · `a` approve · `j/k/arrows/pgup/pgdn` navigate · `d` app history · `e` edit config in `$EDITOR` · `n` create app · `x` delete config only · `g/G` write/remove desktop entry · `p` plugins · `F1` help · `q` quit. Destructive actions ask for confirmation; app-config deletion retains installed files, desktop entry, and database history/state.
 
 Marks are identified by app ID and persist across searches, status filters, and refreshes; the marked count includes hidden apps. Removed apps are unmarked on refresh. `s` confirms the complete marked list in ID order (scroll with `j/k` or arrows); an empty selection does nothing, and the operation is cancelled if an app is removed or disabled before confirmation. Enabled marked apps can be updated regardless of their displayed status, including apt and flatpak apps. Their configured `apply_cmd` determines the actual operation and may update dependencies or other packages beyond the selected apps; selection does not constrain package-manager side effects.
@@ -276,6 +384,9 @@ Marks are identified by app ID and persist across searches, status filters, and 
 During an update, the activity line shows the current app and stage. Asset downloads show bytes received and, when the server provides a content length, the total and percentage. Git, package-manager, Docker, and plugin operations report their stage but not internal transfer progress.
 
 Interrupted asset downloads can resume when the server supplies a strong ETag and supports validated HTTP range requests. If the resource changes or the server cannot validate the partial download, the download restarts. The configured timeout and size cap still apply; available asset digests are verified as usual.
+Engine downloads use per-app cache directories; older partial downloads in the
+shared cache root are not migrated or resumed. Inspect them and confirm no older
+Updatium process is using them before removing them.
 
 `updatium tui --print-frame` renders one frame from DB state and exits — CI-safe.
 
@@ -286,8 +397,9 @@ Interrupted asset downloads can resume when the server supplies a strong ETag an
   never a shell.
 * **HTTPS enforced** — every fetched URL must be https unless an app explicitly
   sets `allow_insecure_http = true`.
-* **Digest verification** — sha256 digests checked per policy before anything is
-  installed; mismatch hard-stops with a `verify_failed` event.
+* **Digest verification** — sha256 digests are checked in bounded memory by
+  streaming the downloaded file before installation; mismatch hard-stops with a
+  `verify_failed` event.
 * **Build-script gate** — source builds hash `tracked_files`; any change stops
   the pipeline until a human approves (diffable snapshot kept).
 * **Archive safety** — zip/tar members are rejected on absolute paths, `..`

@@ -20,30 +20,36 @@ pub fn bundle_hash(files: &[(String, Vec<u8>)]) -> String {
     hex::encode(h.finalize())
 }
 
-/// Collect files under `root` matching any pattern (`*`, `?`, `/**/` supported),
-/// returning `(relative path, contents)` sorted by path. `.git` is skipped.
-pub fn collect_files(root: &Path, patterns: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
-    let mut out = Vec::new();
-    for entry in walkdir::WalkDir::new(root)
+/// Walk matching regular files once, preserving their original filesystem paths.
+fn matching_files<'a>(root: &'a Path, patterns: &'a [String]) -> impl Iterator<Item = (String, walkdir::DirEntry)> + 'a {
+    walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| e.file_name() != ".git")
         .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry
-            .path()
-            .strip_prefix(root)
-            .expect("walkdir yields paths under root")
-            .to_string_lossy()
-            .into_owned();
-        if patterns.iter().any(|p| glob_match(p, &rel)) {
-            let bytes = std::fs::read(entry.path())
-                .with_context(|| format!("reading {}", entry.path().display()))?;
-            out.push((rel, bytes));
-        }
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(move |entry| {
+            let rel = entry.path().strip_prefix(root)
+                .expect("walkdir yields paths under root")
+                .to_string_lossy().into_owned();
+            patterns.iter().any(|p| glob_match(p, &rel)).then_some((rel, entry))
+        })
+}
+
+/// Collect matching paths for publication without loading their contents.
+pub(crate) fn collect_paths(root: &Path, patterns: &[String]) -> Vec<String> {
+    let mut paths: Vec<_> = matching_files(root, patterns).map(|(rel, _)| rel).collect();
+    paths.sort();
+    paths
+}
+
+/// Collect matching relative paths and contents for script hashing and snapshots.
+pub fn collect_files(root: &Path, patterns: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    for (rel, entry) in matching_files(root, patterns) {
+        let bytes = std::fs::read(entry.path())
+            .with_context(|| format!("reading {}", entry.path().display()))?;
+        out.push((rel, bytes));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)

@@ -18,6 +18,7 @@ hex = "0.4.3"
 ratatui = "0.30.2"
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls", "socks"] }
+rustix = { version = "1.1.4", features = ["fs"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -26,6 +27,7 @@ serde_yaml_ng = "0.10"
 sha2 = "0.11.0"
 tar = "0.4.46"
 tokio = { version = "1.53.1", features = ["full"] }
+tempfile = "3.27.0"
 toml = "1.1.4"
 url = { version = "2.5.8", features = ["serde"] }
 walkdir = "2.5.0"
@@ -35,4 +37,3 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 assert_cmd = "2.2.2"
 axum = "0.8.9"
-tempfile = "3.27.0"

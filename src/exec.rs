@@ -93,10 +93,6 @@ fn tail_n(s: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-fn tail(s: &str) -> String {
-    tail_n(s, TAIL_LINES)
-}
-
 /// Expand a leading `~` in each argv element (commands are exec'd without a
 /// shell, so nothing else would expand it).
 fn expand_argv(argv: &[String]) -> Vec<String> {
@@ -113,7 +109,8 @@ fn expand_argv(argv: &[String]) -> Vec<String> {
 ///
 /// With `capture`, stdout/stderr are collected (tails kept, capped at 200
 /// lines); otherwise they inherit this process's streams and tails stay empty.
-/// The child is killed if it exceeds `timeout`.
+/// The direct child is killed if it exceeds `timeout` or the future is dropped.
+/// This does not terminate descendants or protect against the parent being killed.
 pub async fn run(
     cmd: &[String],
     cwd: Option<&Path>,
@@ -236,6 +233,7 @@ async fn run_impl_proxy(
     let expanded = expand_argv(cmd);
     let mut command = tokio::process::Command::new(&expanded[0]);
     command.args(&expanded[1..]);
+    command.kill_on_drop(true);
     if stdin_bytes.is_some() {
         command.stdin(std::process::Stdio::piped());
     } else {
@@ -459,6 +457,33 @@ mod tests {
         let res = run(&cmd, None, Duration::from_millis(100), false).await;
         assert!(res.is_err(), "sleep 5 must hit the 100ms timeout");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn cancelling_run_kills_direct_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let side_effect = dir.path().join("side_effect");
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf ready > ready; while [ ! -e release ]; do sleep 0.05; done; printf executed > side_effect".to_string(),
+        ];
+        let cwd = dir.path().to_owned();
+        let task = tokio::spawn(async move {
+            run(&cmd, Some(&cwd), Duration::from_secs(10), false).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("child did not signal readiness");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        std::fs::write(dir.path().join("release"), b"go").unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!side_effect.exists(), "cancelled child executed its delayed side effect");
     }
 
     #[tokio::test]

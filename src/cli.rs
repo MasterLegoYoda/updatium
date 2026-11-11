@@ -4,7 +4,7 @@
 //! pending approvals.
 
 use crate::config::AppFile;
-use crate::engine::{CheckReport, Engine, Status, UpdateOpts};
+use crate::engine::{CheckReport, Engine, InstalledInfo, InstalledSource, Status, UpdateOpts};
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory as _, Parser, Subcommand, ValueEnum};
 use std::io::Write as _;
@@ -147,8 +147,20 @@ pub enum Cmd {
 // ---------------------------------------------------------------------------
 
 /// Rows of (id, provider, installed, latest, status) rendered as an ASCII grid.
-/// (id, provider, installed, latest, status) tuples.
-pub type TableRow = (String, String, Option<String>, Option<String>, Status);
+pub type TableRow = (String, String, InstalledInfo, Option<String>, Status);
+
+pub(crate) fn format_installed(version: Option<&str>, source: InstalledSource) -> String {
+    let label = match source {
+        InstalledSource::Observed => "observed",
+        InstalledSource::Recorded => "recorded",
+        InstalledSource::Inferred => "inferred",
+        InstalledSource::Unknown => "unknown",
+    };
+    match version {
+        Some(version) => format!("{label}: {version}"),
+        None => label.to_string(),
+    }
+}
 
 pub fn render_table(rows: &[TableRow]) -> String {
     let headers = ["ID", "PROVIDER", "INSTALLED", "LATEST", "STATUS"];
@@ -162,7 +174,7 @@ pub fn render_table(rows: &[TableRow]) -> String {
             [
                 id.clone(),
                 p.clone(),
-                i.clone().unwrap_or_else(|| "—".into()),
+                format_installed(i.version.as_deref(), i.source),
                 l.clone().unwrap_or_else(|| "—".into()),
                 status_str(s),
             ]
@@ -228,16 +240,14 @@ pub fn render_table(rows: &[TableRow]) -> String {
     out
 }
 
-fn report_rows(
-    reports: &[CheckReport],
-) -> Vec<(String, String, Option<String>, Option<String>, Status)> {
+fn report_rows(reports: &[CheckReport]) -> Vec<TableRow> {
     reports
         .iter()
         .map(|r| {
             (
                 r.app.clone(),
                 r.provider.clone(),
-                r.installed.clone(),
+                InstalledInfo { version: r.installed.clone(), source: r.installed_source },
                 r.latest.clone(),
                 r.status.clone(),
             )
@@ -484,16 +494,28 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                     serde_json::to_string_pretty(
                         &rows
                             .into_iter()
-                            .map(|(id, p, i)| serde_json::json!({
-                                "id": id, "provider": p, "installed": i
-                            }))
-                            .collect::<Vec<_>>()
+                            .map(|(id, p, i)| {
+                                let pending = e.pending_update(&id)?;
+                                Ok(serde_json::json!({
+                                    "id": id, "provider": p, "installed": i.version,
+                                    "installed_source": i.source, "update_pending": pending
+                                }))
+                            })
+                            .collect::<Result<Vec<_>>>()?
                     )?
                 );
             } else {
                 let trows = rows
                     .into_iter()
-                    .map(|(id, p, i)| (id, p, i, None::<String>, Status::Ok))
+                    .map(|(id, p, i)| {
+                        let status = match e.pending_update(&id) {
+                            Ok(Some(version)) => Status::Error(format!("update to {version} incomplete or running")),
+                            Ok(None) if i.source == InstalledSource::Unknown => Status::NeverChecked,
+                            Ok(None) => Status::Ok,
+                            Err(error) => Status::Error(format!("{error:#}")),
+                        };
+                        (id, p, i, None::<String>, status)
+                    })
                     .collect::<Vec<_>>();
                 print!("{}", render_table(&trows));
             }
@@ -523,7 +545,8 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                         .map(|r| {
                             serde_json::json!({
                                 "app": r.app, "provider": r.provider,
-                                "installed": r.installed, "latest": r.latest,
+                                "installed": r.installed, "installed_source": r.installed_source,
+                                "latest": r.latest,
                                 "status": match &r.status {
                                     Status::NeverChecked => "never_checked",
                                     Status::Ok => "ok",
@@ -575,6 +598,9 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                     if let Some(f) = &rep.failed {
                         failures.push(format!("{}: {f}", rep.app));
                     }
+                    if !rep.integration_failures.is_empty() {
+                        failures.push(format!("{}: installed, but post-install work failed: {}", rep.app, rep.integration_failures.join("; ")));
+                    }
                     if e.pending_approvals()?.contains(tid) {
                         any_pending = true;
                     }
@@ -587,6 +613,9 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                         }
                         for w in &rep.warnings {
                             println!("   warning: {w}");
+                        }
+                        for failure in &rep.integration_failures {
+                            println!("   POST-INSTALL FAILURE (installation retained): {failure}");
                         }
                         if let Some(f) = &rep.failed {
                             println!("   FAILED: {f}");
@@ -603,6 +632,10 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                                 .iter()
                                 .map(|r| serde_json::json!({
                                     "app": r.app, "from": r.from, "to": r.to,
+                                    "track_only": r.track_only,
+                                    "installed": r.installed,
+                                    "recorded": r.recorded,
+                                    "integration_failures": r.integration_failures,
                                     "actions": r.actions, "warnings": r.warnings,
                                     "failed": r.failed,
                                 }))

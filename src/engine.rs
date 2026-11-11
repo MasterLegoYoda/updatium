@@ -9,7 +9,7 @@ use crate::config::{
 };
 use crate::exec;
 use crate::hash;
-use crate::installer::{self, Publication};
+use crate::installer::{self, InstallOutcome};
 use crate::net::{self, DownloadOpts};
 use crate::provider::{self, Release};
 use crate::store::Store;
@@ -43,11 +43,29 @@ impl Status {
     }
 }
 
+/// How the displayed installed version was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstalledSource {
+    Observed,
+    Inferred,
+    Recorded,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstalledInfo {
+    pub version: Option<String>,
+    pub source: InstalledSource,
+}
+
+
 #[derive(Debug, Clone)]
 pub struct CheckReport {
     pub app: String,
     pub provider: String,
     pub installed: Option<String>,
+    pub installed_source: InstalledSource,
     pub latest: Option<String>,
     pub status: Status,
 }
@@ -73,6 +91,14 @@ pub struct UpdateReport {
     pub app: String,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// The target was observed without running an installation or apply operation.
+    pub track_only: bool,
+    /// Whether the installer or apply operation completed.
+    pub installed: bool,
+    /// Whether the installed version and success event were committed.
+    pub recorded: bool,
+    /// Post-install integration or bookkeeping failures; files were not rolled back.
+    pub integration_failures: Vec<String>,
     pub actions: Vec<String>,
     pub warnings: Vec<String>,
     /// Set when the pipeline stopped with a failure (drives exit code 2).
@@ -173,7 +199,8 @@ impl Engine {
         // Phase 2: sequential state writes + status computation.
         let mut reports = Vec::with_capacity(fetched.len());
         for (app, res) in fetched {
-            let installed = self.installed_for(&app);
+            let info = self.installed_info(&app);
+            let installed = info.version;
             let pending = self.is_pending_approval(&app.id).unwrap_or(false);
 
             match res {
@@ -185,6 +212,7 @@ impl Engine {
                         app: app.id,
                         provider: app.provider,
                         installed,
+                        installed_source: info.source,
                         latest: None,
                         status: Status::Error(msg),
                     });
@@ -207,8 +235,12 @@ impl Engine {
                     // filters (tag_regex, prereleases, ref_regex) can remove a
                     // previously seen version from the current result set.
                     let latest = versions.first().cloned();
-                    let status = if pending {
+                    let status = if let Some(version) = self.pending_update(&app.id)? {
+                        Status::Error(format!("update to {version} is incomplete or still running; installed state may be stale"))
+                    } else if pending {
                         Status::NeedsApproval
+                    } else if app.installed_version_cmd.is_some() && info.source == InstalledSource::Unknown {
+                        Status::Error("installed-version probe failed or returned no version; installed state is unknown".into())
                     } else {
                         match (&installed, &latest) {
                             (_, None) => Status::NeverChecked,
@@ -235,6 +267,7 @@ impl Engine {
                         app: app.id,
                         provider: app.provider,
                         installed,
+                        installed_source: info.source,
                         latest,
                         status,
                     });
@@ -314,12 +347,39 @@ impl Engine {
             .find(|a| a.id == id)
             .with_context(|| format!("unknown app '{id}'"))?;
         anyhow::ensure!(app.enabled, "app '{id}' is disabled");
+
+        // Serialize operations of one app across processes, including recovery.
+        let _lock = self.lock_app(id)?;
         // Ensure the FK target row exists even when update runs without a prior
         // check.
-        self.store
-            .sync_apps(&[(app.id.as_str(), app.provider.as_str(), app.enabled)])?;
+        self.store.sync_apps(&[(app.id.as_str(), app.provider.as_str(), app.enabled)])?;
+        let pending = self.store.pending_update(id)?;
+        if let Some(version) = &pending {
+            if !o.force && !o.dry_run {
+                return Ok(UpdateReport {
+                    app: id.to_owned(), from: self.installed_for(&app), to: Some(version.clone()),
+                    failed: Some(format!("previous update to {version} was interrupted; installation state is uncertain. Inspect the installation and history, then use --force to retry")),
+                    ..Default::default()
+                });
+            }
+        }
 
-        let from = self.installed_for(&app);
+        let info = self.installed_info(&app);
+        let from = info.version;
+        let track_only = match &app.source_kind {
+            SourceKind::Command(c) => c.apply_cmd.is_none(),
+            SourceKind::Apt(c) => c.apply_cmd.is_none(),
+            SourceKind::Flatpak(c) => c.apply_cmd.is_none(),
+            SourceKind::External { .. } => matches!(app.install.kind, InstallType::None),
+            _ => false,
+        };
+        if !track_only && app.installed_version_cmd.is_some() && info.source == InstalledSource::Unknown && !o.force && !o.dry_run {
+            return Ok(UpdateReport {
+                app: id.to_owned(), from: None,
+                failed: Some("installed-version probe failed or returned no version; installation state is unknown. Fix the probe or use --force after inspection".into()),
+                ..Default::default()
+            });
+        }
 
         let mut releases = self
             .check_one_versions(&app)
@@ -342,11 +402,22 @@ impl Engine {
             };
             match chosen {
                 Some(r) => r,
+                None if pending.is_some() && !o.dry_run => {
+                    return Ok(UpdateReport {
+                        app: id.to_owned(), from: from.clone(), to: pending.clone(),
+                        failed: Some("cannot reconcile interrupted update: provider returned no release to retry".into()),
+                        ..Default::default()
+                    });
+                }
                 None => {
                     return Ok(UpdateReport {
                         app: id.to_string(),
                         from: from.clone(),
                         to: from.clone(),
+                        track_only: false,
+                        installed: false,
+                        recorded: false,
+                        integration_failures: vec![],
                         actions: vec!["nothing to do".into()],
                         warnings: vec![],
                         failed: None,
@@ -359,10 +430,24 @@ impl Engine {
             app: id.to_string(),
             from,
             to: Some(target.version.clone()),
+            track_only: false,
+            installed: false,
+            recorded: false,
+            integration_failures: vec![],
             actions: vec![],
             warnings: vec![],
             failed: None,
         };
+
+        if pending.is_some() && track_only && !o.dry_run {
+            rep.failed = Some("cannot reconcile an interrupted installation with a track-only configuration; restore the installer before retrying".into());
+            return Ok(rep);
+        }
+        if track_only {
+            rep.track_only = true;
+            rep.actions.push(format!("track-only: observed {}; no installation performed", target.version));
+            return Ok(rep);
+        }
 
         if o.dry_run {
             // Steps 1-2 only: resolve the asset URL, print plan, mutate nothing.
@@ -378,23 +463,36 @@ impl Engine {
             return Ok(rep);
         }
 
+        self.store.begin_update(id, &target.version)?;
         self.store.event(
             "install_started",
             Some(id),
             Some(&serde_json::json!({"to": target.version}).to_string()),
         )?;
 
-        match self.pipeline(&app, &target, &mut rep, progress).await {
-            Ok(()) => Ok(rep),
-            Err(e) => {
-                let msg = format!("{e:#}");
-                rep.failed = Some(msg.clone());
-                // install_failed already emitted inside pipeline where precise;
-                // ensure an event exists even for early failures:
+        let result = self.pipeline(&app, &target, &mut rep, progress).await;
+        if let Err(error) = result {
+            let msg = format!("{error:#}");
+            if rep.installed {
+                self.integration_failure(&app.id, &mut rep, format!("post-install completion: {msg}"));
+            } else {
+                rep.failed = Some(format!("{msg} (installation may have changed; no rollback is implied)"));
                 let _ = self.store.event("install_failed", Some(id), Some(&msg));
-                Ok(rep)
             }
         }
+        if (pending.is_none() || rep.failed.is_none()) && (!rep.installed || rep.recorded) {
+            if let Err(error) = self.store.finish_update(id) {
+                let detail = format!("could not finalize update bookkeeping: {error:#}; inspect the installation and retry with --force");
+                if rep.installed {
+                    self.integration_failure(id, &mut rep, detail);
+                } else if let Some(failed) = &mut rep.failed {
+                    failed.push_str(&format!("; {detail}"));
+                } else {
+                    rep.failed = Some(detail);
+                }
+            }
+        }
+        Ok(rep)
     }
 
     async fn check_one_versions(&self, app: &AppFile) -> Result<Vec<Release>> {
@@ -511,51 +609,31 @@ impl Engine {
                 return self.build_and_install_source(app, sb, target, rep, progress).await;
             }
             SourceKind::Command(c) => {
-                // Track-and-apply: optional apply_cmd substitutes {version}.
-                if let Some(apply) = &c.apply_cmd {
-                    progress(UpdateProgress::Stage("Installing"));
-                    let vars = BTreeMap::from([("version", target.version.as_str())]);
-                    let argv = exec::substitute(apply, &vars)?;
-                    let detail = serde_json::json!({"cmd": &argv});
-                    self.run_apply_cmd(app, &argv, &detail, rep).await?;
-                } else {
-                    rep.actions.push("track-only (no apply_cmd)".into());
-                }
-                self.store.set_installed(&app.id, &target.version)?;
-                rep.actions
-                    .push(format!("set installed = {}", target.version));
-                return Ok(());
+                let apply = c.apply_cmd.as_ref().context("missing apply_cmd")?;
+                progress(UpdateProgress::Stage("Installing"));
+                let vars = BTreeMap::from([("version", target.version.as_str())]);
+                let argv = exec::substitute(apply, &vars)?;
+                let detail = serde_json::json!({"cmd": &argv});
+                self.run_apply_cmd(app, &argv, &detail, rep).await?;
+                return self.record_install(app, rep, None);
             }
             SourceKind::DockerRegistry(d) => {
                 progress(UpdateProgress::Stage("Applying Docker update"));
                 self.apply_docker(app, d, target, rep).await?;
-                self.store.set_installed(&app.id, &target.version)?;
-                rep.actions
-                    .push(format!("set installed = {}", target.version));
-                return Ok(());
+                return self.record_install(app, rep, None);
             }
             SourceKind::Apt(c) => {
                 progress(UpdateProgress::Stage("Applying apt update"));
                 self.apply_apt(app, c, target, rep).await?;
-                self.store.set_installed(&app.id, &target.version)?;
-                rep.actions
-                    .push(format!("set installed = {}", target.version));
-                return Ok(());
+                return self.record_install(app, rep, None);
             }
             SourceKind::Flatpak(f) => {
                 progress(UpdateProgress::Stage("Applying Flatpak update"));
                 self.apply_flatpak(app, f, target, rep).await?;
-                self.store.set_installed(&app.id, &target.version)?;
-                rep.actions
-                    .push(format!("set installed = {}", target.version));
-                return Ok(());
+                return self.record_install(app, rep, None);
             }
             SourceKind::External { .. } if matches!(app.install.kind, InstallType::None) => {
-                // Track-only: no install requested.
-                self.store.set_installed(&app.id, &target.version)?;
-                rep.actions
-                    .push(format!("set installed = {}", target.version));
-                return Ok(());
+                bail!("external provider has no installer");
             }
             SourceKind::External { .. } => {} // fall through to the asset path
             SourceKind::GithubReleases(_) | SourceKind::HtmlLinks(_) => {}
@@ -577,7 +655,7 @@ impl Engine {
         let download_path = net::download_with_progress(
             &http,
             &asset.url,
-            &self.home.downloads(),
+            &self.home.downloads().join(app_key(&app.id)),
             &opts,
             &|downloaded, total| progress(UpdateProgress::Download { downloaded, total }),
         )
@@ -623,8 +701,16 @@ impl Engine {
             }
             (Some(d), _) => {
                 use sha2::{Digest as _, Sha256};
-                let bytes = std::fs::read(&download_path).context("reading download")?;
-                let actual = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+                use tokio::io::AsyncReadExt as _;
+                let mut file = tokio::fs::File::open(&download_path).await.context("reading download")?;
+                let mut hasher = Sha256::new();
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    let n = file.read(&mut buffer).await.context("reading download")?;
+                    if n == 0 { break; }
+                    hasher.update(&buffer[..n]);
+                }
+                let actual = format!("sha256:{}", hex::encode(hasher.finalize()));
                 if actual != *d {
                     let detail = serde_json::json!({
                         "expected": d, "actual": actual, "asset": asset.name
@@ -663,16 +749,7 @@ impl Engine {
             on_extracted: Some(&on_extracted),
         };
         let outcome = inst.install(&ctx).await?;
-        rep.actions.extend(outcome.actions);
-        match outcome.publication {
-            Some(p) => {
-                self.publish_common(app, p, rep)?;
-            }
-            None => {
-                self.finish_install(app, outcome.exec_hint.as_deref(), rep)?;
-            }
-        }
-        Ok(())
+        self.finalize_installer_outcome(app, outcome, rep)
     }
 
     /// Clone (first time) or fetch an existing checkout, then detach onto the
@@ -816,13 +893,8 @@ impl Engine {
                 bail!("install_dir requires at least one build.install_steps command");
             }
             let destination = crate::config::expand_tilde(install_dir);
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let staging_root = destination.with_file_name(format!(".{}-staging-{}", app.id, target.version));
-            let _ = std::fs::remove_dir_all(&staging_root);
-            std::fs::create_dir_all(&staging_root)?;
-            let staging_text = staging_root.to_string_lossy().into_owned();
+            let staging_root = installer::stage_directory(&destination)?;
+            let staging_text = staging_root.path().to_string_lossy().into_owned();
             let mut vars = BTreeMap::new();
             vars.insert("install_dir", staging_text.as_str());
             for (i, step) in sb.build.install_steps.iter().enumerate() {
@@ -839,14 +911,8 @@ impl Engine {
                 );
                 rep.actions.push(format!("install[{}] ok", command[0]));
             }
-            if destination.exists() {
-                std::fs::remove_dir_all(&destination)
-                    .with_context(|| format!("replacing {}", destination.display()))?;
-            }
-            std::fs::rename(&staging_root, &destination)
-                .with_context(|| format!("activating {}", destination.display()))?;
-            self.store.event("install_ok", Some(&app.id), None)?;
-            return self.post_build_finish(app, target, rep).await;
+            installer::activate_directory(staging_root.path(), &destination)?;
+            return self.record_install(app, rep, Some((&destination, true)));
         }
 
         // Default path: publish through Updatium's managed installer tree.
@@ -865,115 +931,70 @@ impl Engine {
             on_extracted: None,
         };
         let outcome = inst.install(&ctx).await?;
-        rep.actions.extend(outcome.actions);
-        let pubn = outcome
-            .publication
-            .context("dir installer returned no publication")?;
-        self.publish_common(app, pubn, rep)?;
-        self.post_build_finish(app, target, rep).await
+        anyhow::ensure!(outcome.publication.is_some(), "dir installer returned no publication");
+        self.finalize_installer_outcome(app, outcome, rep)
     }
-    fn finish_install(
-        &self,
-        app: &AppFile,
-        exec_hint: Option<&Path>,
-        rep: &mut UpdateReport,
-    ) -> Result<()> {
-        self.store.event("install_ok", Some(&app.id), None)?;
-        if let Some(to) = rep.to.clone() {
-            self.store.set_installed(&app.id, &to)?;
-            rep.actions.push(format!("set installed = {to}"));
-        }
-        if let (Some(to), Some(from)) = (rep.to.clone(), rep.from.clone()) {
-            let _ = (from, to); // kept for future changelog hooks
-        }
-        if let Some(d) = &app.install.desktop {
-            match exec_hint {
-                Some(exec) => {
-                    let icon = d.icon.as_deref().map(crate::config::expand_tilde);
-                    desktop_entry_write(
-                        &self.home.desktop_dir,
-                        &app.id,
-                        &d.name,
-                        exec,
-                        icon.as_deref(),
-                        &d.categories,
-                        d.terminal,
-                    )?;
-                    rep.actions.push(format!("desktop entry '{}'", d.name));
-                }
-                None => {
-                    rep.warnings.push(
-                        "desktop requested but installer returned no exec path".into(),
-                    );
-                }
-            }
-        }
+    fn record_install(&self, app: &AppFile, rep: &mut UpdateReport, target: Option<(&Path, bool)>) -> Result<()> {
+        let version = rep.to.as_deref().context("missing installation target")?;
+        rep.installed = true;
+        let target = target.map(|(path, is_dir)| -> Result<_> {
+            let path = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+            Ok((path, is_dir))
+        }).transpose()?;
+        self.store.record_install(&app.id, version, target.as_ref().map(|(path, is_dir)| (path.as_path(), *is_dir)))
+            .context("recording installed version")?;
+        rep.recorded = true;
+        rep.actions.push(format!("set installed = {version}"));
         Ok(())
     }
 
-    fn publish_common(
-        &self,
-        app: &AppFile,
-        mut pubn: Publication,
-        rep: &mut UpdateReport,
-    ) -> Result<PathBuf> {
-        // Symlink publication into ~/.local/bin (or relocated equivalent).
-        if !app.install.link_bins.is_empty() {
-            pubn = installer::link_bins(
-                pubn,
-                &self.home.install_current(&app.id),
-                &app.id,
-                &self.home.installs(),
-                &app.install.link_bins,
-                &self.home.local_bin,
-            )?;
-            for l in &pubn.linked {
-                rep.actions.push(format!("linked {}", l.display()));
-            }
-            for c in &pubn.conflicts {
-                self.store.event(
-                    "install_failed",
-                    Some(&app.id),
-                    Some(&serde_json::json!({"conflict": c}).to_string()),
-                )?;
-                rep.warnings.push(c.clone());
-            }
-        }
-        self.store.event("install_ok", Some(&app.id), None)?;
-        if let Some(to) = rep.to.clone() {
-            self.store.set_installed(&app.id, &to)?;
-            rep.actions.push(format!("set installed = {to}"));
-        }
-        let exec_hint = self
-            .home
-            .install_current(&app.id)
-            .join(pubn.published.first().map(String::as_str).unwrap_or(""));
-        if let Some(d) = &app.install.desktop {
-            let icon = d.icon.as_deref().map(crate::config::expand_tilde);
-            desktop_entry_write(
-                &self.home.desktop_dir,
-                &app.id,
-                &d.name,
-                &exec_hint,
-                icon.as_deref(),
-                &d.categories,
-                d.terminal,
-            )?;
-            rep.actions.push(format!("desktop entry '{}'", d.name));
-        }
-        Ok(exec_hint)
+    fn integration_failure(&self, app: &str, rep: &mut UpdateReport, detail: String) {
+        let _ = self.store.event("integration_failed", Some(app), Some(&detail));
+        rep.integration_failures.push(detail);
     }
 
-    async fn post_build_finish(
-        &self,
-        app: &AppFile,
-        target: &Release,
-        rep: &mut UpdateReport,
-    ) -> Result<()> {
-        self.store.set_installed(&app.id, &target.version)?;
-        rep.actions
-            .push(format!("set installed = {}", target.version));
-        let _ = app;
+    fn desktop_integration(&self, app: &AppFile, exec_hint: Option<&Path>, rep: &mut UpdateReport) {
+        let Some(d) = &app.install.desktop else { return; };
+        let Some(exec) = exec_hint else {
+            self.integration_failure(&app.id, rep, "desktop requested but installer returned no exec path".into());
+            return;
+        };
+        let icon = d.icon.as_deref().map(crate::config::expand_tilde);
+        match desktop_entry_write(&self.home.desktop_dir, &app.id, &d.name, exec, icon.as_deref(), &d.categories, d.terminal) {
+            Ok(_) => rep.actions.push(format!("desktop entry '{}'", d.name)),
+            Err(error) => self.integration_failure(&app.id, rep, format!("desktop entry: {error:#}")),
+        }
+    }
+
+    /// Record a completed installer operation before optional integrations.
+    fn finalize_installer_outcome(&self, app: &AppFile, outcome: InstallOutcome, rep: &mut UpdateReport) -> Result<()> {
+        rep.actions.extend(outcome.actions);
+        let current = self.home.install_current(&app.id);
+        let exec_hint = match &outcome.publication {
+            Some(pubn) => Some(current.join(pubn.published.first().map(String::as_str).unwrap_or(""))),
+            None => outcome.exec_hint,
+        };
+        let target = if outcome.publication.is_some() {
+            Some((current.as_path(), true))
+        } else if matches!(app.install.kind, InstallType::Appimage) {
+            exec_hint.as_deref().map(|path| (path, false))
+        } else {
+            None
+        };
+        self.record_install(app, rep, target)?;
+        if let Some(pubn) = outcome.publication {
+            if !app.install.link_bins.is_empty() {
+                match installer::link_bins(pubn, &current, &app.id,
+                    &self.home.installs(), &app.install.link_bins, &self.home.local_bin) {
+                    Ok(pubn) => {
+                        for link in &pubn.linked { rep.actions.push(format!("linked {}", link.display())); }
+                        for conflict in pubn.conflicts { self.integration_failure(&app.id, rep, conflict); }
+                    }
+                    Err(error) => self.integration_failure(&app.id, rep, format!("linking binaries: {error:#}")),
+                }
+            }
+        }
+        self.desktop_integration(app, exec_hint.as_deref(), rep);
         Ok(())
     }
 
@@ -1008,10 +1029,7 @@ impl Engine {
         target: &Release,
         rep: &mut UpdateReport,
     ) -> Result<()> {
-        let Some(apply) = &cfg.apply_cmd else {
-            rep.actions.push("track-only (no apply_cmd)".into());
-            return Ok(());
-        };
+        let apply = cfg.apply_cmd.as_ref().context("missing apt apply_cmd")?;
         let vars: BTreeMap<&str, &str> = BTreeMap::from([
             ("package", cfg.package.as_str()),
             ("version", target.version.as_str()),
@@ -1028,10 +1046,7 @@ impl Engine {
         target: &Release,
         rep: &mut UpdateReport,
     ) -> Result<()> {
-        let Some(apply) = &cfg.apply_cmd else {
-            rep.actions.push("track-only (no apply_cmd)".into());
-            return Ok(());
-        };
+        let apply = cfg.apply_cmd.as_ref().context("missing Flatpak apply_cmd")?;
         let vars: BTreeMap<&str, &str> = BTreeMap::from([
             ("app_id", cfg.app_id.as_str()),
             ("remote", cfg.remote.as_str()),
@@ -1089,17 +1104,50 @@ impl Engine {
     // Introspection for CLI/TUI/tests
     // -----------------------------------------------------------------
 
-    /// Installed version for `app`: recorded install state wins, then an
-    /// optional user-provided detection command (for installs done outside
-    /// Updatium), then a source-build checkout fallback.
+    /// Observe an explicit probe on every read; otherwise report historical
+    /// installation state without presenting it as a current observation.
+    pub fn installed_info(&self, app: &AppFile) -> InstalledInfo {
+        if app.installed_version_cmd.is_some() {
+            return match self.detect_installed_version_cmd(app) {
+                Some(version) => InstalledInfo { version: Some(version), source: InstalledSource::Observed },
+                None => InstalledInfo { version: None, source: InstalledSource::Unknown },
+            };
+        }
+        let recorded = match self.store.state(&app.id) {
+            Ok(state) => state.and_then(|s| s.installed_version),
+            Err(_) => return InstalledInfo { version: None, source: InstalledSource::Unknown },
+        };
+        if let Some(version) = recorded {
+            let target = match self.store.install_target(&app.id) {
+                Ok(target) => target.or_else(|| self.legacy_install_target(app)),
+                Err(_) => return InstalledInfo { version: None, source: InstalledSource::Unknown },
+            };
+            if let Some((path, is_dir)) = target {
+                if !(if is_dir { path.is_dir() } else { path.is_file() }) {
+                    return InstalledInfo { version: None, source: InstalledSource::Unknown };
+                }
+            }
+            return InstalledInfo { version: Some(version), source: InstalledSource::Recorded };
+        }
+        match self.detect_source_build_version(app) {
+            Some(version) => InstalledInfo { version: Some(version), source: InstalledSource::Inferred },
+            None => InstalledInfo { version: None, source: InstalledSource::Unknown },
+        }
+    }
+    fn legacy_install_target(&self, app: &AppFile) -> Option<(PathBuf, bool)> {
+        if let SourceKind::SourceBuild(sb) = &app.source_kind {
+            return Some((sb.install_dir.as_deref().map(crate::config::expand_tilde)
+                .unwrap_or_else(|| self.home.install_current(&app.id)), true));
+        }
+        if matches!(app.source_kind, SourceKind::GithubReleases(_) | SourceKind::HtmlLinks(_) | SourceKind::External { .. })
+            && matches!(app.install.kind, InstallType::Archive | InstallType::Dir) {
+            return Some((self.home.install_current(&app.id), true));
+        }
+        None
+    }
+
     pub fn installed_for(&self, app: &AppFile) -> Option<String> {
-        self.store
-            .state(&app.id)
-            .ok()
-            .flatten()
-            .and_then(|s| s.installed_version)
-            .or_else(|| self.detect_installed_version_cmd(app))
-            .or_else(|| self.detect_source_build_version(app))
+        self.installed_info(app).version
     }
 
     /// Run the app's `installed_version_cmd` and take the first non-empty
@@ -1189,8 +1237,13 @@ impl Engine {
         self.store.latest_known(id)
     }
 
+    /// A durable marker remains until the update finishes or is explicitly retried.
+    pub fn pending_update(&self, id: &str) -> Result<Option<String>> {
+        self.store.pending_update(id)
+    }
+
     /// (id, provider, installed) rows for `updatium list` and the TUI frame.
-    pub fn store_list(&self) -> Result<Vec<(String, String, Option<String>)>> {
+    pub fn store_list(&self) -> Result<Vec<(String, String, InstalledInfo)>> {
         let apps: std::collections::HashMap<String, AppFile> = self
             .load_apps()?
             .into_iter()
@@ -1199,13 +1252,17 @@ impl Engine {
         let mut out = Vec::new();
         for a in self.store.list_apps()? {
             let installed = match apps.get(&a.id) {
-                Some(app) => self.installed_for(app),
-                None => self
-                    .store
-                    .state(&a.id)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.installed_version),
+                Some(app) => self.installed_info(app),
+                None => {
+                    let version = self.store.state(&a.id)?.and_then(|s| s.installed_version);
+                    let target = self.store.install_target(&a.id)?;
+                    let exists = target.as_ref().is_none_or(|(p, is_dir)| if *is_dir { p.is_dir() } else { p.is_file() });
+                    if exists && version.is_some() {
+                        InstalledInfo { version, source: InstalledSource::Recorded }
+                    } else {
+                        InstalledInfo { version: None, source: InstalledSource::Unknown }
+                    }
+                }
             };
             out.push((a.id, a.provider, installed));
         }
@@ -1226,6 +1283,14 @@ impl Engine {
         &self.home
     }
 
+    fn lock_app(&self, id: &str) -> Result<std::fs::File> {
+        let locks = self.home.state_dir.join("update-locks");
+        std::fs::create_dir_all(&locks)?;
+        let lock = std::fs::OpenOptions::new().create(true).write(true).open(locks.join(app_key(id)))?;
+        lock.try_lock().with_context(|| format!("another update or approval of '{id}' is running"))?;
+        Ok(lock)
+    }
+
     /// Recompute the tracked-files bundle and clear the approval gate.
     /// Returns (old_hash, new_hash).
     pub fn approve(&self, id: &str) -> Result<(Option<String>, String)> {
@@ -1234,6 +1299,7 @@ impl Engine {
             .into_iter()
             .find(|a| a.id == id)
             .with_context(|| format!("unknown app '{id}'"))?;
+        let _lock = self.lock_app(id)?;
         let sb = match &app.source_kind {
             SourceKind::SourceBuild(sb) => sb.clone(),
             _ => bail!("approval gate applies only to source-build apps"),
@@ -1330,6 +1396,11 @@ impl Engine {
         }
         Ok(true)
     }
+}
+
+fn app_key(id: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    hex::encode(Sha256::digest(id.as_bytes()))
 }
 
 /// Thin wrapper so both install paths share the desktop writer call.

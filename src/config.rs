@@ -602,8 +602,8 @@ pub struct AppFile {
     pub digest_policy: DigestPolicy,
     pub allow_insecure_http: bool,
     pub proxy: Option<String>,
-    /// Optional argv whose first non-empty stdout line is the version currently
-    /// installed outside Updatium's own state (adoption/detection fallback).
+    /// Optional authoritative version probe, consulted even after an update.
+    /// A failed or empty probe means the installed version is unknown.
     pub installed_version_cmd: Option<Vec<String>>,
     pub install: InstallCfg,
     pub source_kind: SourceKind,

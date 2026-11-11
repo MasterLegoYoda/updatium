@@ -15,6 +15,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "approved",
     "install_started",
     "install_ok",
+    "integration_failed",
     "install_failed",
     "applied",
     "notified",
@@ -31,6 +32,10 @@ CREATE TABLE IF NOT EXISTS app_state(
   app_id TEXT PRIMARY KEY REFERENCES apps(id),
   installed_version TEXT, installed_at TEXT,
   script_hash TEXT, last_check TEXT, last_error TEXT);
+CREATE TABLE IF NOT EXISTS pending_updates(
+  app_id TEXT PRIMARY KEY REFERENCES apps(id), version TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS install_targets(
+  app_id TEXT PRIMARY KEY REFERENCES apps(id), path BLOB NOT NULL, is_dir INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS events(
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
   app_id TEXT, kind TEXT NOT NULL, detail TEXT);
@@ -208,6 +213,53 @@ impl Store {
                                                installed_at = excluded.installed_at",
             )?
             .execute((app, version, now()))?;
+        Ok(())
+    }
+
+    /// Atomically record the installed version and its completion event.
+    pub fn record_install(&self, app: &str, version: &str, target: Option<(&Path, bool)>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO app_state(app_id, installed_version, installed_at) VALUES(?1, ?2, ?3)
+             ON CONFLICT(app_id) DO UPDATE SET installed_version=excluded.installed_version,
+                                               installed_at=excluded.installed_at",
+            (app, version, now()),
+        )?;
+        if let Some((path, is_dir)) = target {
+            use std::os::unix::ffi::OsStrExt;
+            tx.execute("INSERT INTO install_targets(app_id, path, is_dir) VALUES(?1, ?2, ?3)
+                ON CONFLICT(app_id) DO UPDATE SET path=excluded.path, is_dir=excluded.is_dir",
+                (app, path.as_os_str().as_bytes(), is_dir))?;
+        } else {
+            tx.execute("DELETE FROM install_targets WHERE app_id=?1", [app])?;
+        }
+        tx.execute("INSERT INTO events(ts, app_id, kind, detail) VALUES(?1, ?2, 'install_ok', ?3)",
+            (now(), app, serde_json::json!({"version": version}).to_string()))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn install_target(&self, app: &str) -> Result<Option<(std::path::PathBuf, bool)>> {
+        use std::os::unix::ffi::OsStringExt;
+        self.conn.query_row("SELECT path, is_dir FROM install_targets WHERE app_id=?1", [app], |r| {
+            let bytes: Vec<u8> = r.get(0)?;
+            Ok((std::ffi::OsString::from_vec(bytes).into(), r.get(1)?))
+        }).optional().map_err(Into::into)
+    }
+
+    pub fn pending_update(&self, app: &str) -> Result<Option<String>> {
+        self.conn.query_row("SELECT version FROM pending_updates WHERE app_id=?1", [app], |row| row.get(0))
+            .optional().map_err(Into::into)
+    }
+
+    pub fn begin_update(&self, app: &str, version: &str) -> Result<()> {
+        self.conn.execute("INSERT INTO pending_updates(app_id, version) VALUES(?1, ?2)
+            ON CONFLICT(app_id) DO UPDATE SET version=excluded.version", (app, version))?;
+        Ok(())
+    }
+
+    pub fn finish_update(&self, app: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM pending_updates WHERE app_id=?1", [app])?;
         Ok(())
     }
 

@@ -4,7 +4,7 @@
 use crate::config::{GlobalConfig, HomePaths, InstallCfg};
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::hash::collect_files;
+use crate::hash::collect_paths;
 use anyhow::{Context, Result, bail};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -177,7 +177,7 @@ fn unzip(download: &Path, staging: &Path) -> Result<()> {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(
                 &dest,
-                std::fs::Permissions::from_mode((mode >> 16) & 0o7777),
+                std::fs::Permissions::from_mode(mode & 0o7777),
             );
         }
     }
@@ -205,19 +205,46 @@ pub fn strip_single_root_dir(dir: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Publication into current/
 // ---------------------------------------------------------------------------
+/// Atomically publish a staged directory without ever removing the active one.
+/// A successful exchange leaves the old directory at `staged` for cleanup.
+pub(crate) fn activate_directory(staged: &Path, destination: &Path) -> Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    let metadata = std::fs::symlink_metadata(staged)
+        .with_context(|| format!("activating {}: inspecting staging directory", destination.display()))?;
+    anyhow::ensure!(metadata.file_type().is_dir(), "activating {}: staging path is not a directory", destination.display());
+    match std::fs::symlink_metadata(destination) {
+        Ok(meta) => anyhow::ensure!(meta.file_type().is_dir(), "{} is not a directory", destination.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error).with_context(|| format!("inspecting {}", destination.display())),
+    }
+    let exchange = renameat_with(CWD, staged, CWD, destination, RenameFlags::EXCHANGE);
+    match exchange {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::NOENT) => renameat_with(CWD, staged, CWD, destination, RenameFlags::NOREPLACE)
+            .with_context(|| format!("activating {}", destination.display())),
+        Err(error) => Err(error).with_context(|| format!("atomically activating {}", destination.display())),
+    }
+}
+
+/// Create an independently owned staging directory beside the destination.
+pub(crate) fn stage_directory(destination: &Path) -> Result<tempfile::TempDir> {
+    let parent = destination.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    tempfile::Builder::new().prefix(".updatium-staging-").tempdir_in(parent)
+        .with_context(|| format!("creating staging directory in {}", parent.display()))
+}
+
 
 fn copy_matched(
     src_root: &Path,
-    rel_files: &[(String, Vec<u8>)],
+    rel_files: Vec<String>,
     current_dir: &Path,
 ) -> Result<Vec<String>> {
-    let staged = current_dir.with_file_name(format!(".current-staging-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staged);
-    std::fs::create_dir_all(&staged)?;
+    let staged = stage_directory(current_dir)?;
 
-    let mut published = Vec::new();
-    for (rel, _bytes) in rel_files.iter() {
-        let dest = staged.join(rel);
+    for rel in &rel_files {
+        let dest = staged.path().join(rel);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -232,24 +259,14 @@ fn copy_matched(
                     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode & 0o7777));
             }
         }
-        published.push(rel.clone());
     }
 
-    // Cutover: only now replace the previous current/.
-    if current_dir.exists() {
-        std::fs::remove_dir_all(current_dir)
-            .with_context(|| format!("replacing {}", current_dir.display()))?;
-    }
-    if let Some(parent) = current_dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::rename(&staged, current_dir)
-        .with_context(|| format!("activating {}", current_dir.display()))?;
-    Ok(published)
+    activate_directory(staged.path(), current_dir)?;
+    Ok(rel_files)
 }
 
 /// Publish files matching `install.bin_glob` from an extracted staging dir into
-/// `current_dir` (wipe-after-success cutover).
+/// `current_dir` using an atomic exchange when replacing an existing directory.
 pub fn publish_from_staging(
     staging: &Path,
     install: &InstallCfg,
@@ -258,8 +275,8 @@ pub fn publish_from_staging(
     if install.bin_glob.is_empty() {
         bail!("archive install requires at least one bin_glob pattern");
     }
-    let files = collect_files(staging, &install.bin_glob)?;
-    let published = copy_matched(staging, &files, current_dir)?;
+    let files = collect_paths(staging, &install.bin_glob);
+    let published = copy_matched(staging, files, current_dir)?;
     Ok(Publication {
         published,
         linked: vec![],
@@ -274,8 +291,8 @@ pub fn publish_from_checkout(
     artifacts: &[String],
     current_dir: &Path,
 ) -> Result<Publication> {
-    let files = collect_files(checkout, artifacts)?;
-    let published = copy_matched(checkout, &files, current_dir)?;
+    let files = collect_paths(checkout, artifacts);
+    let published = copy_matched(checkout, files, current_dir)?;
     Ok(Publication {
         published,
         linked: vec![],
@@ -388,11 +405,11 @@ pub fn install_appimage(download: &Path, filename: &str, target: &Path) -> Resul
     );
     std::fs::create_dir_all(target).with_context(|| format!("creating {}", target.display()))?;
     let dest = target.join(safe_name);
-    let tmp = target.join(format!(".{}.tmp-{}", safe_name, std::process::id()));
-    std::fs::copy(download, &tmp).with_context(|| format!("copying into {}", tmp.display()))?;
+    let tmp = tempfile::Builder::new().prefix(".updatium-appimage-").tempfile_in(target)?;
+    std::fs::copy(download, tmp.path()).with_context(|| format!("copying into {}", tmp.path().display()))?;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&tmp, &dest).with_context(|| format!("activating {}", dest.display()))?;
+    tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    tmp.persist(&dest).with_context(|| format!("activating {}", dest.display()))?;
     Ok(dest)
 }
 
@@ -422,16 +439,15 @@ pub struct InstallCtx<'a> {
     pub on_extracted: Option<&'a (dyn Fn() + Send + Sync)>,
 }
 
-/// What an installer did. `publication: Some` hands the post-publish tail
-/// (link_bins, desktop, state) back to the engine; otherwise the engine runs
-/// the plain finish path with `exec_hint`.
+/// What an installer did. The engine records completion, then applies optional
+/// link and desktop integrations using the returned publication or exec hint.
 #[derive(Debug)]
 pub struct InstallOutcome {
     /// Appended to UpdateReport.actions verbatim.
     pub actions: Vec<String>,
     /// Desktop Exec target; None → engine derives/omits.
     pub exec_hint: Option<PathBuf>,
-    /// Some → engine runs publish_common tail.
+    /// Some → engine links the published files and derives the desktop exec.
     pub publication: Option<Publication>,
 }
 
@@ -483,18 +499,15 @@ impl Installer for ArchiveInstaller {
         let Some(download) = ctx.download else {
             bail!("archive install requires a downloaded asset");
         };
-        let staging = ctx
-            .home
-            .installs()
-            .join(ctx.app_id)
-            .join(format!(".staging-{}", ctx.version));
-        let _ = std::fs::remove_dir_all(&staging);
-        extract_archive(download, &staging)?;
-        strip_single_root_dir(&staging)?;
+        // Never remove a pre-existing stage: it may belong to another process
+        // or contain evidence needed after an interrupted update.
+        let staging = stage_directory(&ctx.home.install_current(ctx.app_id))?;
+        extract_archive(download, staging.path())?;
+        strip_single_root_dir(staging.path())?;
         if let Some(on_extracted) = ctx.on_extracted {
             on_extracted();
         }
-        let pubn = publish_from_staging(&staging, ctx.cfg, &ctx.home.install_current(ctx.app_id))?;
+        let pubn = publish_from_staging(staging.path(), ctx.cfg, &ctx.home.install_current(ctx.app_id))?;
         Ok(InstallOutcome {
             actions: vec![format!("published {} artifacts", pubn.published.len())],
             exec_hint: None,
@@ -852,6 +865,46 @@ mod tests {
         assert!(err.contains("symlink"));
     }
 
+    #[tokio::test]
+    async fn zip_permissions_survive_extraction_and_installation() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("app.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        zip.start_file("root/bin/tool", zip::write::SimpleFileOptions::default().unix_permissions(0o750)).unwrap();
+        zip.write_all(b"#!/bin/sh\nprintf working").unwrap();
+        zip.start_file("root/share/readme", zip::write::SimpleFileOptions::default().unix_permissions(0o644)).unwrap();
+        zip.write_all(b"ordinary file").unwrap();
+        zip.finish().unwrap();
+
+        let staging = dir.path().join("extracted");
+        extract_archive(&archive, &staging).unwrap();
+        for (name, expected) in [("root/bin/tool", 0o750), ("root/share/readme", 0o644)] {
+            assert_eq!(std::fs::metadata(staging.join(name)).unwrap().permissions().mode() & 0o777, expected);
+        }
+
+        let home = HomePaths::resolve(Some(dir.path())).unwrap();
+        let install = InstallCfg { kind: crate::config::InstallType::Archive, bin_glob: vec!["bin/**".into(), "share/**".into()], ..Default::default() };
+        let extra = serde_json::json!({});
+        let ctx = InstallCtx {
+            app_id: "demo", version: "1.0.0", cfg: &install, extra: &extra,
+            download: Some(&archive), filename: Some("app.zip"), checkout: None,
+            artifacts: &[], home: &home, on_extracted: None,
+        };
+        let outcome = ArchiveInstaller.install(&ctx).await.unwrap();
+        assert_eq!(outcome.publication.unwrap().published, ["bin/tool", "share/readme"]);
+        let current = home.install_current("demo");
+        for (name, expected) in [("bin/tool", 0o750), ("share/readme", 0o644)] {
+            assert_eq!(std::fs::metadata(current.join(name)).unwrap().permissions().mode() & 0o777, expected);
+        }
+        assert_eq!(std::fs::read(current.join("share/readme")).unwrap(), b"ordinary file");
+        let output = std::process::Command::new(current.join("bin/tool")).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"working");
+    }
+
     #[test]
     fn tar_gz_extraction_with_exec_bits_and_root_strip() {
         let dir = tempfile::tempdir().unwrap();
@@ -906,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_wipes_previous_current_only_after_success() {
+    fn publish_replaces_previous_current() {
         let dir = tempfile::tempdir().unwrap();
         let staging = dir.path().join("stage");
         std::fs::create_dir_all(staging.join("bin")).unwrap();
@@ -928,14 +981,125 @@ mod tests {
         assert_eq!(pubn.published, vec!["bin/cli"]);
         assert!(!current.join("OLD").exists());
         assert!(current.join("bin/cli").exists());
-        // No staging litter left behind.
-        let siblings: Vec<_> = std::fs::read_dir(current.parent().unwrap())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(".current-staging"))
-            .collect();
-        assert!(siblings.is_empty(), "{siblings:?}");
+    }
+
+    #[tokio::test]
+    async fn archive_install_leaves_preexisting_staging_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomePaths::resolve(Some(dir.path())).unwrap();
+        let archive = dir.path().join("asset.tar.gz");
+        let file = std::fs::File::create(&archive).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(b"installed".len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "root/bin/tool", b"installed".as_slice()).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+        let prior = home.installs().join("demo/.staging-1.0.0");
+        std::fs::create_dir_all(&prior).unwrap();
+        std::fs::write(prior.join("sentinel"), b"leave intact").unwrap();
+        let install = InstallCfg { kind: crate::config::InstallType::Archive, bin_glob: vec!["bin/*".into()], ..Default::default() };
+        let extra = serde_json::json!({});
+        let ctx = InstallCtx {
+            app_id: "demo", version: "1.0.0", cfg: &install, extra: &extra,
+            download: Some(&archive), filename: Some("asset.tar.gz"), checkout: None,
+            artifacts: &[], home: &home, on_extracted: None,
+        };
+        let outcome = ArchiveInstaller.install(&ctx).await.unwrap();
+        assert_eq!(outcome.publication.unwrap().published, ["bin/tool"]);
+        assert_eq!(std::fs::read(home.install_current("demo").join("bin/tool")).unwrap(), b"installed");
+        assert_eq!(std::fs::read(prior.join("sentinel")).unwrap(), b"leave intact");
+    }
+
+    #[test]
+    fn archive_and_checkout_publish_matching_files_with_executable_bits() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(source.join("bin/nested")).unwrap();
+        std::fs::create_dir_all(source.join(".git")).unwrap();
+        std::fs::write(source.join("bin/tool"), b"#!/bin/sh\nprintf working").unwrap();
+        std::fs::set_permissions(source.join("bin/tool"), std::fs::Permissions::from_mode(0o751)).unwrap();
+        std::fs::write(source.join("bin/nested/data"), b"artifact data").unwrap();
+        std::fs::write(source.join("ignore"), b"not selected").unwrap();
+        std::fs::write(source.join(".git/config"), b"not published").unwrap();
+        symlink("tool", source.join("bin/link")).unwrap();
+        let patterns = vec!["bin/**".into(), "bin/*".into(), ".git/**".into()];
+        let install = InstallCfg { kind: crate::config::InstallType::Archive, bin_glob: patterns.clone(), ..Default::default() };
+
+        for archive in [true, false] {
+            let current = dir.path().join(if archive { "archive/current" } else { "checkout/current" });
+            let publication = if archive {
+                publish_from_staging(&source, &install, &current).unwrap()
+            } else {
+                publish_from_checkout(&source, &patterns, &current).unwrap()
+            };
+            assert_eq!(publication.published, ["bin/nested/data", "bin/tool"]);
+            assert_eq!(std::fs::read(current.join("bin/nested/data")).unwrap(), b"artifact data");
+            assert!(!current.join("ignore").exists());
+            assert!(!current.join(".git/config").exists());
+            assert!(!current.join("bin/link").exists());
+            assert_eq!(std::fs::metadata(current.join("bin/tool")).unwrap().permissions().mode() & 0o111, 0o111);
+            let output = std::process::Command::new(current.join("bin/tool")).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"working");
+        }
+    }
+
+    #[test]
+    fn failed_activation_keeps_the_previous_installation_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current");
+        std::fs::create_dir(&current).unwrap();
+        let tool = current.join("tool");
+        std::fs::write(&tool, b"#!/bin/sh\nprintf old-working-tool").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Exchanging a directory with its descendant fails at the rename syscall.
+        let staged = current.join("stage");
+        std::fs::create_dir(&staged).unwrap();
+        let error = activate_directory(&staged, &current).unwrap_err();
+        assert!(format!("{error:#}").contains("activating"));
+        let output = std::process::Command::new(&tool).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"old-working-tool");
+    }
+
+    #[test]
+    fn interruption_on_either_side_of_exchange_leaves_an_active_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::write(current.join("tool"), b"old").unwrap();
+        // A process dying before activation can leave a staged candidate.
+        let before = stage_directory(&current).unwrap().keep();
+        std::fs::write(before.join("tool"), b"candidate").unwrap();
+        assert_eq!(std::fs::read(current.join("tool")).unwrap(), b"old");
+
+        // A process dying after the exchange leaves the previous install in
+        // staging; the new install is already active, without recovery steps.
+        let after = stage_directory(&current).unwrap().keep();
+        std::fs::write(after.join("tool"), b"new").unwrap();
+        activate_directory(&after, &current).unwrap();
+        assert_eq!(std::fs::read(current.join("tool")).unwrap(), b"new");
+        assert_eq!(std::fs::read(after.join("tool")).unwrap(), b"old");
+        assert_eq!(std::fs::read(before.join("tool")).unwrap(), b"candidate");
+    }
+
+    #[test]
+    fn failed_appimage_activation_preserves_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let download = dir.path().join("download");
+        std::fs::write(&download, b"new").unwrap();
+        let target = dir.path().join("applications");
+        let occupied = target.join("app.AppImage");
+        std::fs::create_dir_all(&occupied).unwrap();
+        std::fs::write(occupied.join("tool"), b"old").unwrap();
+        assert!(install_appimage(&download, "app.AppImage", &target).is_err());
+        assert_eq!(std::fs::read(occupied.join("tool")).unwrap(), b"old");
     }
 
     #[test]
@@ -1070,8 +1234,12 @@ mod tests {
             std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
             0o755
         );
-        // No tmp leftovers.
-        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+        std::fs::write(&src, b"updated AppImage").unwrap();
+        install_appimage(&src, "FreeCAD-1.0-x86_64.AppImage", &target).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"updated AppImage");
+        std::fs::remove_file(&src).unwrap();
+        assert!(install_appimage(&src, "FreeCAD-1.0-x86_64.AppImage", &target).is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"updated AppImage");
     }
 }
 

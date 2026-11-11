@@ -3,7 +3,7 @@
 mod common;
 
 use std::path::Path;
-use updatium::engine::{Engine, Status, UpdateOpts, UpdateProgress};
+use updatium::engine::{Engine, InstalledSource, Status, UpdateOpts, UpdateProgress};
 
 fn write_app(home: &Path, id: &str, body: &str) {
     let dir = home.join("config").join("apps.d");
@@ -91,6 +91,8 @@ async fn full_appimage_lifecycle() {
         e.installed_version("demo").unwrap().as_deref(),
         Some("2.1.0")
     );
+    let reports = e.check(None).await.unwrap();
+    assert_eq!(reports[0].installed_source, InstalledSource::Recorded);
 
     let desktop = home.path().join("state/applications/updatium.demo.desktop");
     assert!(desktop.exists());
@@ -118,6 +120,16 @@ async fn full_appimage_lifecycle() {
         .await
         .unwrap();
     assert!(rep.failed.is_none(), "{rep:?}");
+
+    // A recorded version is not evidence that a removed managed artifact exists.
+    std::fs::remove_file(&installed_path).unwrap();
+    let reports = e.check(None).await.unwrap();
+    assert_eq!(reports[0].installed, None);
+    assert_eq!(reports[0].installed_source, InstalledSource::Unknown);
+    let rep = e.update("demo", &UpdateOpts::default()).await.unwrap();
+    assert!(rep.failed.is_none(), "{rep:?}");
+    assert_eq!(rep.to.as_deref(), Some("2.1.0"));
+    assert!(installed_path.exists());
 }
 
 #[tokio::test]
@@ -205,6 +217,64 @@ type = "none"
         .unwrap();
     assert_eq!(rep.from.as_deref(), Some("2.0.0"));
     assert_eq!(rep.to.as_deref(), Some("2.1.0"));
+}
+
+#[tokio::test]
+async fn explicit_probe_reconciles_after_apply_without_rewriting_history() {
+    let home = tempfile::tempdir().unwrap();
+    let version = home.path().join("installed");
+    std::fs::write(&version, "1.0.0\n").unwrap();
+    let config = |probe: &str| format!(r#"
+id = "demo"
+provider = "command"
+check_cmd = ["sh", "-c", "echo 2.0.0"]
+apply_cmd = ["sh", "-c", "printf '%s\\n' \"$1\" > '{path}'", "--", "{{version}}"]
+installed_version_cmd = ["sh", "-c", "{probe}"]
+[install]
+type = "none"
+"#, path = version.display());
+    let probe = format!("cat '{}'", version.display());
+    write_app(home.path(), "demo", &config(&probe));
+    let e = engine(home.path());
+    let applied = e.update("demo", &UpdateOpts::default()).await.unwrap();
+    assert!(applied.failed.is_none(), "{applied:?}");
+    assert_eq!(applied.to.as_deref(), Some("2.0.0"));
+
+    for (observed, status_update, target) in [
+        ("3.0.0\nignored\n", false, false),
+        ("1.5.0\n", true, true),
+    ] {
+        std::fs::write(&version, observed).unwrap();
+        let reports = e.check(None).await.unwrap();
+        assert_eq!(reports[0].installed.as_deref(), observed.lines().next());
+        assert_eq!(reports[0].installed_source, InstalledSource::Observed);
+        assert_eq!(matches!(reports[0].status, Status::UpdateAvailable), status_update);
+        let dry = e.update("demo", &UpdateOpts { dry_run: true, ..Default::default() }).await.unwrap();
+        assert_eq!(dry.to.as_deref() == Some("2.0.0"), target);
+    }
+
+    for bad_probe in ["exit 1", "printf ''", &probe] {
+        if bad_probe == probe { std::fs::remove_file(&version).unwrap(); }
+        write_app(home.path(), "demo", &config(bad_probe));
+        let reports = e.check(None).await.unwrap();
+        assert_eq!(reports[0].installed, None);
+        assert_eq!(reports[0].installed_source, InstalledSource::Unknown);
+        let update = e.update("demo", &UpdateOpts::default()).await.unwrap();
+        assert!(update.failed.is_some(), "{update:?}");
+    }
+
+    std::fs::write(&version, "1.0.0\n").unwrap();
+    write_app(home.path(), "demo", &config(&probe));
+    let reports = e.check(None).await.unwrap();
+    assert_eq!(reports[0].installed.as_deref(), Some("1.0.0"));
+    assert_eq!(reports[0].installed_source, InstalledSource::Observed);
+    assert!(matches!(reports[0].status, Status::UpdateAvailable));
+
+    // Removing the probe exposes the original successful apply, not an observation.
+    write_app(home.path(), "demo", &config(&probe).lines().filter(|line| !line.starts_with("installed_version_cmd")).collect::<Vec<_>>().join("\n"));
+    let reports = e.check(None).await.unwrap();
+    assert_eq!(reports[0].installed.as_deref(), Some("2.0.0"));
+    assert_eq!(reports[0].installed_source, InstalledSource::Recorded);
 }
 
 #[tokio::test]
@@ -352,12 +422,56 @@ type = "dir"
     // No DB install state, but the checkout is at b1000 -> report it.
     let reports = e.check(None).await.unwrap();
     assert_eq!(reports[0].installed.as_deref(), Some("b1000"));
+    assert_eq!(reports[0].installed_source, InstalledSource::Inferred);
     assert_eq!(reports[0].latest.as_deref(), Some("b2000"));
     assert!(matches!(reports[0].status, Status::UpdateAvailable));
     assert_eq!(
         e.installed_version("srcdemo").unwrap().as_deref(),
         Some("b1000")
     );
+}
+
+#[tokio::test]
+async fn external_source_cutover_failure_preserves_the_previous_installation() {
+    let repo = tempfile::tempdir().unwrap();
+    make_git_repo_with_tags(repo.path());
+    let home = tempfile::tempdir().unwrap();
+    let destination = home.path().join("external-install");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("tool"), b"original").unwrap();
+    let configure = |install_steps: &str| write_app(home.path(), "srcdemo", &format!(r#"
+id = "srcdemo"
+provider = "source-build"
+repo_url = "{repo}"
+install_dir = "{destination}"
+ref_regex = '^refs/tags/b\d+$'
+[build]
+steps = [["true"]]
+tracked_files = ["README.md"]
+artifacts = []
+install_steps = {install_steps}
+[install]
+type = "dir"
+"#, repo = repo.path().display(), destination = destination.display()));
+    let e = engine(home.path());
+    configure(r#"[["sh", "-c", "printf new > \"$1/tool\"", "--", "{install_dir}"]]"#);
+    let first = e.update("srcdemo", &UpdateOpts::default()).await.unwrap();
+    assert!(first.failed.is_none(), "{first:?}");
+    assert_eq!(std::fs::read(destination.join("tool")).unwrap(), b"new");
+    assert_eq!(e.installed_version("srcdemo").unwrap().as_deref(), Some("b2000"));
+
+    // A successful install command that removes its staging directory forces
+    // the subsequent atomic activation to fail, after the old install exists.
+    configure(r#"[["sh", "-c", "rm -rf -- \"$1\"", "--", "{install_dir}"]]"#);
+    let failed = e.update("srcdemo", &UpdateOpts { force: true, ..Default::default() }).await.unwrap();
+    assert!(failed.failed.as_deref().unwrap().contains("activating"), "{failed:?}");
+    assert_eq!(std::fs::read(destination.join("tool")).unwrap(), b"new");
+    assert_eq!(e.installed_version("srcdemo").unwrap().as_deref(), Some("b2000"));
+
+    std::fs::remove_dir_all(&destination).unwrap();
+    let checked = e.check(None).await.unwrap();
+    assert_eq!(checked[0].installed, None);
+    assert_eq!(checked[0].installed_source, InstalledSource::Unknown);
 }
 
 #[tokio::test]

@@ -1,27 +1,47 @@
 //! Version ordering used everywhere a "latest" must be picked.
 //!
-//! Rule: if both sides parse as strict semver (`semver::Version`), compare with
-//! semver precedence (handles prereleases like `1.0.0-rc.1 < 1.0.0`). Otherwise
-//! fall back to a natural (version-aware) byte order: the strings are split into
-//! digit-runs and non-digit-runs; digit runs compare numerically, non-digit runs
-//! byte-wise; a proper prefix sorts lower. Total order, pure function.
+//! SemVer tags (optionally prefixed with `v` or `V`), two-component
+//! versions, and zero-padded numeric cores share SemVer precedence.
+//! Other strings form a separate, lower-sorting class ordered naturally. A
+//! fixed class per string keeps comparisons transitive across mixed formats.
 
 use std::cmp::Ordering;
 
-/// Compare two version strings.
+/// Compare versions without changing the original release tag.
 pub fn cmp_version(a: &str, b: &str) -> Ordering {
-    match (
-        semver::Version::parse(a.trim()),
-        semver::Version::parse(b.trim()),
-    ) {
-        // Build metadata must not create phantom updates: compare core + prerelease.
-        (Ok(mut va), Ok(mut vb)) => {
-            va.build = semver::BuildMetadata::EMPTY;
-            vb.build = semver::BuildMetadata::EMPTY;
-            va.cmp(&vb)
-        }
-        _ => natural_cmp(a.trim().as_bytes(), b.trim().as_bytes()),
+    let (a, b) = (a.trim(), b.trim());
+    match (semantic_version(a), semantic_version(b)) {
+        (Some(a), Some(b)) => a.cmp_precedence(&b),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => natural_cmp(a.as_bytes(), b.as_bytes()),
     }
+}
+
+fn semantic_version(tag: &str) -> Option<semver::Version> {
+    let tag = tag.strip_prefix('v').or_else(|| tag.strip_prefix('V')).unwrap_or(tag);
+    if let Ok(version) = semver::Version::parse(tag) {
+        return Some(version);
+    }
+
+    // Common partial and zero-padded versions are not strict SemVer. Normalize
+    // the numeric core; validate the suffix with the SemVer parser.
+    let end = tag.find(['-', '+']).unwrap_or(tag.len());
+    let core = &tag[..end];
+    let mut parts = core.split('.');
+    let (Some(major), Some(minor), patch, None) =
+        (parts.next(), parts.next(), parts.next(), parts.next()) else {
+            return None;
+        };
+    let parts = [major, minor, patch.unwrap_or("0")];
+    if !parts.iter().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let normalized = parts.map(|part| {
+        let stripped = part.trim_start_matches('0');
+        if stripped.is_empty() { "0" } else { stripped }
+    });
+    semver::Version::parse(&format!("{}.{}.{}{}", normalized[0], normalized[1], normalized[2], &tag[end..])).ok()
 }
 
 enum Chunk<'a> {
@@ -30,23 +50,17 @@ enum Chunk<'a> {
 }
 
 /// Split into alternating digit / non-digit runs.
-fn chunks(mut s: &[u8]) -> Vec<Chunk<'_>> {
-    let mut out = Vec::new();
-    while !s.is_empty() {
+fn chunks(mut s: &[u8]) -> impl Iterator<Item = Chunk<'_>> {
+    std::iter::from_fn(move || {
+        if s.is_empty() {
+            return None;
+        }
         let digit = s[0].is_ascii_digit();
-        let end = s
-            .iter()
-            .position(|c| c.is_ascii_digit() != digit)
-            .unwrap_or(s.len());
+        let end = s.iter().position(|c| c.is_ascii_digit() != digit).unwrap_or(s.len());
         let (chunk, rest) = s.split_at(end);
-        out.push(if digit {
-            Chunk::Num(chunk)
-        } else {
-            Chunk::Str(chunk)
-        });
         s = rest;
-    }
-    out
+        Some(if digit { Chunk::Num(chunk) } else { Chunk::Str(chunk) })
+    })
 }
 
 fn cmp_num(a: &[u8], b: &[u8]) -> Ordering {
@@ -63,10 +77,9 @@ fn strip_zeros(mut s: &[u8]) -> &[u8] {
 }
 
 fn natural_cmp(a: &[u8], b: &[u8]) -> Ordering {
-    let ca = chunks(a);
-    let cb = chunks(b);
-    for i in 0..ca.len().max(cb.len()) {
-        match (ca.get(i), cb.get(i)) {
+    let (mut ca, mut cb) = (chunks(a), chunks(b));
+    loop {
+        match (ca.next(), cb.next()) {
             (None, None) => return Ordering::Equal,
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
@@ -84,7 +97,6 @@ fn natural_cmp(a: &[u8], b: &[u8]) -> Ordering {
             }
         }
     }
-    Ordering::Equal
 }
 
 #[cfg(test)]
@@ -121,9 +133,48 @@ mod tests {
     }
 
     #[test]
-    fn mixed_semver_and_natural() {
-        // "v" prefix blocks semver parsing -> natural order, still correct here.
+    fn mixed_formats_have_stable_class_order() {
         assert_eq!(cmp_version("v1.10", "v1.9"), Greater);
-        assert_eq!(cmp_version("1.2.3", "1.2.3"), Equal);
+        assert_eq!(cmp_version("v1.10", "1.9.0"), Greater);
+        assert_eq!(cmp_version("1.2", "v1.2.0+build"), Equal);
+        assert_eq!(cmp_version("1.2.3", "v1.2.3+build.7"), Equal);
+        assert_eq!(cmp_version("2024.06.2", "2024.6.12"), Less);
+        assert_eq!(cmp_version("1.2.3", "b999"), Greater);
+    }
+
+    #[test]
+    fn prefixed_semver_uses_semver_precedence() {
+        assert_eq!(cmp_version("v1.0.0-rc.1", "v1.0.0"), Less);
+        assert_eq!(cmp_version("V1.0.0", "1.0.0+build.2"), Equal);
+        assert_eq!(cmp_version("v1.0.0-alpha.10", "1.0.0-alpha.2"), Greater);
+        assert_eq!(cmp_version("1.0.0-alpha.1", "1.0.0-alpha.beta"), Less);
+        assert_eq!(cmp_version("v1.0.0-alpha-beta", "1.0.0-alpha.1"), Greater);
+    }
+
+    #[test]
+    fn comparison_is_transitive_and_equality_is_consistent() {
+        let versions = [
+            "1.0.0", "v1.0.0", "V1.0.0+build.1", "1.0.0-rc.1",
+            "1.0.0-alpha.2", "1.0.0-alpha.10", "1.0.0-alpha.beta",
+            "1.0.0-alpha-beta", "1.0.0-rc.01", "1.0", "v1.0",
+            "b999", "b1234", "2024.06.2", "2024.6.12", "2024-06-02",
+            "2024-06-12", "1.02.003", "1.2.3", "1.2.3+other", "",
+        ];
+        for a in versions {
+            for b in versions {
+                let ab = cmp_version(a, b);
+                assert_eq!(ab, cmp_version(b, a).reverse(), "{a:?}, {b:?}");
+                for c in versions {
+                    let bc = cmp_version(b, c);
+                    let ac = cmp_version(a, c);
+                    if ab != Greater && bc != Greater {
+                        assert_ne!(ac, Greater, "{a:?} <= {b:?} <= {c:?}");
+                    }
+                    if ab == Equal {
+                        assert_eq!(ac, bc, "{a:?} == {b:?}, versus {c:?}");
+                    }
+                }
+            }
+        }
     }
 }
