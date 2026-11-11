@@ -418,6 +418,8 @@ pub struct InstallCtx<'a> {
     /// Source-build artifact globs (dir installer).
     pub artifacts: &'a [String],
     pub home: &'a HomePaths,
+    /// Called after archive extraction and before publication.
+    pub on_extracted: Option<&'a (dyn Fn() + Send + Sync)>,
 }
 
 /// What an installer did. `publication: Some` hands the post-publish tail
@@ -489,6 +491,9 @@ impl Installer for ArchiveInstaller {
         let _ = std::fs::remove_dir_all(&staging);
         extract_archive(download, &staging)?;
         strip_single_root_dir(&staging)?;
+        if let Some(on_extracted) = ctx.on_extracted {
+            on_extracted();
+        }
         let pubn = publish_from_staging(&staging, ctx.cfg, &ctx.home.install_current(ctx.app_id))?;
         Ok(InstallOutcome {
             actions: vec![format!("published {} artifacts", pubn.published.len())],
@@ -1157,6 +1162,7 @@ mod plugin_tests {
             checkout: None,
             artifacts: &[],
             home: &g.home,
+            on_extracted: None,
         };
         let err = DirInstaller.install(&ctx).await.unwrap_err().to_string();
         assert!(err.contains("requires a source-build checkout"), "{err}");
@@ -1187,6 +1193,7 @@ mod plugin_tests {
             checkout: None,
             artifacts: &[],
             home: &g.home,
+            on_extracted: None,
         };
         let err = ext.install(&ctx).await.unwrap_err().to_string();
         assert!(err.contains("unsupported protocol 1"), "{err}");
@@ -1221,6 +1228,7 @@ mod plugin_tests {
             checkout: None,
             artifacts: &[],
             home: &g.home,
+            on_extracted: None,
         };
         let err = ext.install(&ctx).await.unwrap_err().to_string();
         assert!(err.contains("'install' verb"), "{err}");

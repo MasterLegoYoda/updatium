@@ -59,6 +59,15 @@ pub struct UpdateOpts {
     pub force: bool,
 }
 
+/// Transient progress for an update; download totals are absent without Content-Length.
+#[derive(Debug, Clone)]
+pub enum UpdateProgress {
+    Stage(&'static str),
+    Download { downloaded: u64, total: Option<u64> },
+}
+
+type ProgressCallback<'a> = &'a (dyn Fn(UpdateProgress) + Send + Sync);
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct UpdateReport {
     pub app: String,
@@ -271,6 +280,17 @@ impl Engine {
     // -----------------------------------------------------------------
 
     pub async fn update(&self, id: &str, o: &UpdateOpts) -> Result<UpdateReport> {
+        self.update_with_progress(id, o, &|_| {}).await
+    }
+
+    /// Run an update while reporting its current stage and asset download progress.
+    pub async fn update_with_progress(
+        &self,
+        id: &str,
+        o: &UpdateOpts,
+        progress: ProgressCallback<'_>,
+    ) -> Result<UpdateReport> {
+        progress(UpdateProgress::Stage("Checking for updates"));
         // Step 1: pick target version.
         let apps = self.load_apps()?;
         let app = apps
@@ -348,7 +368,7 @@ impl Engine {
             Some(&serde_json::json!({"to": target.version}).to_string()),
         )?;
 
-        match self.pipeline(&app, &target, &mut rep).await {
+        match self.pipeline(&app, &target, &mut rep, progress).await {
             Ok(()) => Ok(rep),
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -467,15 +487,17 @@ impl Engine {
         app: &AppFile,
         target: &Release,
         rep: &mut UpdateReport,
+        progress: ProgressCallback<'_>,
     ) -> Result<()> {
         match &app.source_kind {
             SourceKind::SourceBuild(sb) => {
                 // Steps 5-7: no downloadable assets; checkout + gate + build.
-                return self.build_and_install_source(app, sb, target, rep).await;
+                return self.build_and_install_source(app, sb, target, rep, progress).await;
             }
             SourceKind::Command(c) => {
                 // Track-and-apply: optional apply_cmd substitutes {version}.
                 if let Some(apply) = &c.apply_cmd {
+                    progress(UpdateProgress::Stage("Installing"));
                     let vars = BTreeMap::from([("version", target.version.as_str())]);
                     let argv = exec::substitute(apply, &vars)?;
                     let detail = serde_json::json!({"cmd": &argv});
@@ -489,6 +511,7 @@ impl Engine {
                 return Ok(());
             }
             SourceKind::DockerRegistry(d) => {
+                progress(UpdateProgress::Stage("Applying Docker update"));
                 self.apply_docker(app, d, target, rep).await?;
                 self.store.set_installed(&app.id, &target.version)?;
                 rep.actions
@@ -496,6 +519,7 @@ impl Engine {
                 return Ok(());
             }
             SourceKind::Apt(c) => {
+                progress(UpdateProgress::Stage("Applying apt update"));
                 self.apply_apt(app, c, target, rep).await?;
                 self.store.set_installed(&app.id, &target.version)?;
                 rep.actions
@@ -503,6 +527,7 @@ impl Engine {
                 return Ok(());
             }
             SourceKind::Flatpak(f) => {
+                progress(UpdateProgress::Stage("Applying Flatpak update"));
                 self.apply_flatpak(app, f, target, rep).await?;
                 self.store.set_installed(&app.id, &target.version)?;
                 rep.actions
@@ -531,9 +556,16 @@ impl Engine {
             timeout: std::time::Duration::from_secs(self.global.download_timeout_secs),
             allow_insecure_http: app.allow_insecure_http,
         };
-        let download_path = net::download(&self.http, &asset.url, &self.home.downloads(), &opts)
-            .await
-            .context("downloading asset")?;
+        progress(UpdateProgress::Stage("Downloading"));
+        let download_path = net::download_with_progress(
+            &self.http,
+            &asset.url,
+            &self.home.downloads(),
+            &opts,
+            &|downloaded, total| progress(UpdateProgress::Download { downloaded, total }),
+        )
+        .await
+        .context("downloading asset")?;
         self.store.event(
             "download_done",
             Some(&app.id),
@@ -549,6 +581,7 @@ impl Engine {
         rep.actions.push(format!("downloaded {}", asset.name));
 
         // Step 4: digest gate.
+        progress(UpdateProgress::Stage("Verifying"));
         match (&asset.digest, app.digest_policy) {
             (None, DigestPolicy::Required) => {
                 bail!(
@@ -594,6 +627,12 @@ impl Engine {
         // Steps 5-7: installer registry dispatch.
         let inst = installer::lookup(&self.installers, &app.install.kind.key())?;
         let extra_table = app.install.extra_table();
+        if matches!(app.install.kind, InstallType::Archive) {
+            progress(UpdateProgress::Stage("Decompressing"));
+        } else {
+            progress(UpdateProgress::Stage("Installing"));
+        }
+        let on_extracted = || progress(UpdateProgress::Stage("Installing"));
         let ctx = installer::InstallCtx {
             app_id: &app.id,
             version: &target.version,
@@ -604,6 +643,7 @@ impl Engine {
             checkout: None,
             artifacts: &[],
             home: &self.home,
+            on_extracted: Some(&on_extracted),
         };
         let outcome = inst.install(&ctx).await?;
         rep.actions.extend(outcome.actions);
@@ -679,12 +719,15 @@ impl Engine {
         sb: &crate::config::SourceBuildCfg,
         target: &Release,
         rep: &mut UpdateReport,
+        progress: ProgressCallback<'_>,
     ) -> Result<()> {
         // Step 5: checkout + integrity gate.
+        progress(UpdateProgress::Stage("Fetching and checking out source"));
         let checkout = self
             .checkout_source(&sb.repo_url, &app.id, &target.version, sb.source_dir.as_deref())
             .await?;
         rep.actions.push(format!("checked out {}", target.version));
+        progress(UpdateProgress::Stage("Checking build scripts"));
 
         let files = hash::collect_files(&checkout, &sb.build.tracked_files)?;
         if files.is_empty() {
@@ -728,6 +771,7 @@ impl Engine {
         hash::save_snapshot(&self.home.script_snapshots().join(&app.id), &bundle, &files)?;
 
         // Step 6: build steps sequentially.
+        progress(UpdateProgress::Stage("Building"));
         let timeout = std::time::Duration::from_secs(sb.build.timeout_secs);
         for (i, step) in sb.build.steps.iter().enumerate() {
             let out = exec::run_env(step, Some(&checkout), timeout, &sb.build.env, true)
@@ -746,6 +790,7 @@ impl Engine {
         }
 
         // Step 7: install into a configured external directory via a staging prefix.
+        progress(UpdateProgress::Stage("Installing"));
         if let Some(install_dir) = sb.install_dir.as_deref() {
             if sb.build.install_steps.is_empty() {
                 bail!("install_dir requires at least one build.install_steps command");
@@ -797,6 +842,7 @@ impl Engine {
             checkout: Some(&checkout),
             artifacts: &sb.build.artifacts,
             home: &self.home,
+            on_extracted: None,
         };
         let outcome = inst.install(&ctx).await?;
         rep.actions.extend(outcome.actions);

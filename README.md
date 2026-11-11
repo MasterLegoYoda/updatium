@@ -246,7 +246,14 @@ Status markers: `● ok ▲ update ⚠ approval ✖ error · unchecked`.
 `LATEST` is the newest version in the current provider result; versions removed
 by a config filter (such as `tag_regex` or `ref_regex`) do not linger.
 
-TUI keys: `/` search · `f` cycle status filters · `r` refresh · `u` update selected · `U` bulk update eligible apps · `a` approve · `j/k/arrows/pgup/pgdn` navigate · `d` app history · `e` edit config in `$EDITOR` · `n` create app · `x` delete config only · `g/G` write/remove desktop entry · `p` plugins · `F1` help · `q` quit. Destructive actions ask for confirmation; app-config deletion retains installed files, desktop entry, and database history/state.
+TUI keys: `/` search · `f` cycle status filters · `r` refresh · `u` update the highlighted app · `U` bulk update eligible apps · `Space` toggle a mark · `s` update marked apps · `c` clear all marks · `a` approve · `j/k/arrows/pgup/pgdn` navigate · `d` app history · `e` edit config in `$EDITOR` · `n` create app · `x` delete config only · `g/G` write/remove desktop entry · `p` plugins · `F1` help · `q` quit. Destructive actions ask for confirmation; app-config deletion retains installed files, desktop entry, and database history/state.
+
+Marks are identified by app ID and persist across searches, status filters, and refreshes; the marked count includes hidden apps. Removed apps are unmarked on refresh. `s` confirms the complete marked list in ID order (scroll with `j/k` or arrows); an empty selection does nothing, and the operation is cancelled if an app is removed or disabled before confirmation. Enabled marked apps can be updated regardless of their displayed status, including apt and flatpak apps. Their configured `apply_cmd` determines the actual operation and may update dependencies or other packages beyond the selected apps; selection does not constrain package-manager side effects.
+
+During an update, the activity line shows the current app and stage. Asset downloads show bytes received and, when the server provides a content length, the total and percentage. Git, package-manager, Docker, and plugin operations report their stage but not internal transfer progress.
+
+Interrupted asset downloads can resume when the server supplies a strong ETag and supports validated HTTP range requests. If the resource changes or the server cannot validate the partial download, the download restarts. The configured timeout and size cap still apply; available asset digests are verified as usual.
+
 `updatium tui --print-frame` renders one frame from DB state and exits — CI-safe.
 
 ## Security model

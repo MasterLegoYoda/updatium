@@ -3,7 +3,7 @@
 mod common;
 
 use std::path::Path;
-use updatium::engine::{Engine, Status, UpdateOpts};
+use updatium::engine::{Engine, Status, UpdateOpts, UpdateProgress};
 
 fn write_app(home: &Path, id: &str, body: &str) {
     let dir = home.join("config").join("apps.d");
@@ -70,7 +70,18 @@ async fn full_appimage_lifecycle() {
     assert!(e.installed_version("demo").unwrap().is_none());
 
     // Real update installs the appimage + desktop + state.
-    let rep = e.update("demo", &UpdateOpts::default()).await.unwrap();
+    let progress = std::sync::Mutex::new(Vec::new());
+    let rep = e.update_with_progress("demo", &UpdateOpts::default(), &|event| {
+        progress.lock().unwrap().push(event);
+    }).await.unwrap();
+    let progress = progress.into_inner().unwrap();
+    assert!(matches!(progress.first(), Some(UpdateProgress::Stage("Checking for updates"))));
+    let stages: Vec<_> = progress.iter().filter_map(|event| match event {
+        UpdateProgress::Stage(stage) => Some(*stage),
+        _ => None,
+    }).collect();
+    assert_eq!(stages, ["Checking for updates", "Downloading", "Verifying", "Installing"]);
+    assert!(progress.iter().any(|event| matches!(event, UpdateProgress::Download { downloaded, total: Some(total) } if *downloaded > 0 && downloaded == total)));
     assert!(rep.failed.is_none(), "{rep:?}");
     let installed_path = home
         .path()
@@ -366,7 +377,15 @@ async fn source_build_gate_blocks_changed_scripts_until_approved() {
     let e = engine(home.path());
 
     // First build passes the gate (hash recorded) and publishes out.txt.
-    let rep = e.update("srcdemo", &UpdateOpts::default()).await.unwrap();
+    let progress = std::sync::Mutex::new(Vec::new());
+    let rep = e.update_with_progress("srcdemo", &UpdateOpts::default(), &|event| {
+        progress.lock().unwrap().push(event);
+    }).await.unwrap();
+    let stages: Vec<_> = progress.into_inner().unwrap().into_iter().filter_map(|event| match event {
+        UpdateProgress::Stage(stage) => Some(stage),
+        _ => None,
+    }).collect();
+    assert_eq!(stages, ["Checking for updates", "Fetching and checking out source", "Checking build scripts", "Building", "Installing"]);
     assert!(rep.failed.is_none(), "{rep:?}");
     let out = home.path().join("state/installs/srcdemo/current/out.txt");
     assert_eq!(std::fs::read(&out).unwrap(), b"build me v1\n");

@@ -2,7 +2,7 @@
 //! worker thread; `--print-frame` remains a network-free DB/config snapshot.
 
 use crate::config::{self, HomePaths};
-use crate::engine::{Engine, Status};
+use crate::engine::{Engine, Status, UpdateProgress};
 use anyhow::{Context as _, Result, bail};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -11,7 +11,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -110,6 +110,7 @@ enum UiMsg {
     Events(String, Vec<crate::store::EventRow>),
     Plugins(Vec<PluginRow>),
     Activity(String),
+    Progress(Option<(String, UpdateProgress)>),
     Scaffold(std::result::Result<PathBuf, String>),
     Fatal(String),
     Finished,
@@ -240,21 +241,13 @@ fn worker_loop(home: Option<PathBuf>, cmd_rx: mpsc::Receiver<Cmd>, msg_tx: mpsc:
         match command {
             Cmd::Refresh => worker_refresh(&engine, &runtime, &msg_tx),
             Cmd::Update(id) => {
-                let result = runtime.block_on(engine.update(
-                    &id,
-                    &crate::engine::UpdateOpts::default(),
-                ));
-                let _ = msg_tx.send(UiMsg::Activity(update_result(&id, result)));
+                worker_update(&engine, &runtime, &msg_tx, &id);
                 worker_refresh(&engine, &runtime, &msg_tx);
             }
             Cmd::UpdateMany(mut ids) => {
                 ids.sort();
                 for id in ids {
-                    let result = runtime.block_on(engine.update(
-                        &id,
-                        &crate::engine::UpdateOpts::default(),
-                    ));
-                    let _ = msg_tx.send(UiMsg::Activity(update_result(&id, result)));
+                    worker_update(&engine, &runtime, &msg_tx, &id);
                 }
                 worker_refresh(&engine, &runtime, &msg_tx);
             }
@@ -343,6 +336,59 @@ fn worker_loop(home: Option<PathBuf>, cmd_rx: mpsc::Receiver<Cmd>, msg_tx: mpsc:
             }
         }
     }
+}
+
+fn worker_update(
+    engine: &Engine,
+    runtime: &tokio::runtime::Runtime,
+    tx: &mpsc::Sender<UiMsg>,
+    id: &str,
+) {
+    let result = runtime.block_on(engine.update_with_progress(
+        id,
+        &crate::engine::UpdateOpts::default(),
+        &|progress| {
+            let _ = tx.send(UiMsg::Progress(Some((id.to_owned(), progress))));
+        },
+    ));
+    let _ = tx.send(UiMsg::Progress(None));
+    let _ = tx.send(UiMsg::Activity(update_result(id, result)));
+}
+
+fn progress_text(id: &str, progress: &UpdateProgress) -> String {
+    match progress {
+        UpdateProgress::Stage(stage) => format!("{id}: {stage}"),
+        UpdateProgress::Download {
+            downloaded,
+            total: Some(total),
+        } if *total > 0 => {
+            let percent = (u128::from(*downloaded) * 100 / u128::from(*total)).min(100);
+            format!(
+                "{id}: Downloading {} / {} ({percent}%)",
+                format_bytes(*downloaded),
+                format_bytes(*total)
+            )
+        }
+        UpdateProgress::Download { downloaded, .. } => {
+            format!("{id}: Downloading {}", format_bytes(*downloaded))
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for next in ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"] {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
+    }
+    format!("{value:.1} {unit}")
 }
 
 fn update_result(id: &str, result: Result<crate::engine::UpdateReport>) -> String {
@@ -494,6 +540,7 @@ enum Screen {
 enum Confirmation {
     Update(String),
     BulkUpdate(Vec<String>),
+    SelectedUpdate(Vec<String>),
     Approve(String),
     DeleteConfig { id: String, path: PathBuf },
     RemoveDesktop(String),
@@ -509,16 +556,19 @@ struct NewAppForm {
 struct UiState {
     rows: Vec<UiRow>,
     selected: usize,
+    marked: BTreeSet<String>,
     show_detail: bool,
     detail: Option<(String, Vec<crate::store::EventRow>)>,
     status_line: String,
     activity: VecDeque<String>,
+    progress: Option<(String, UpdateProgress)>,
     busy: usize,
     filter: Filter,
     search: String,
     search_input: Option<String>,
     screen: Screen,
     confirmation: Option<Confirmation>,
+    confirmation_scroll: u16,
     plugins: Vec<PluginRow>,
     plugins_loaded: bool,
     form: Option<NewAppForm>,
@@ -530,16 +580,19 @@ impl Default for UiState {
         Self {
             rows: Vec::new(),
             selected: 0,
+            marked: BTreeSet::new(),
             show_detail: false,
             detail: None,
             status_line: "starting…".into(),
             activity: VecDeque::new(),
+            progress: None,
             busy: 0,
             filter: Filter::All,
             search: String::new(),
             search_input: None,
             screen: Screen::Dashboard,
             confirmation: None,
+            confirmation_scroll: 0,
             plugins: Vec::new(),
             plugins_loaded: false,
             form: None,
@@ -582,6 +635,28 @@ impl UiState {
             })
             .unwrap_or(0);
         visible
+    }
+
+    fn toggle_mark(&mut self, visible: &[usize]) {
+        if let Some(id) = self.selected_id(visible) {
+            if !self.marked.remove(&id) {
+                self.marked.insert(id);
+            }
+        }
+    }
+
+    fn replace_rows(&mut self, rows: Vec<UiRow>) {
+        self.rows = rows;
+        self.marked.retain(|id| self.rows.iter().any(|row| &row.app == id));
+    }
+
+    fn confirm_marked_update(&mut self) {
+        if self.marked.is_empty() {
+            self.push_activity("selected update: no marked apps".into());
+        } else {
+            self.confirmation_scroll = 0;
+            self.confirmation = Some(Confirmation::SelectedUpdate(self.marked.iter().cloned().collect()));
+        }
     }
 
     fn push_activity(&mut self, text: String) {
@@ -665,7 +740,7 @@ fn drive_ui(
                 Ok(UiMsg::Rows(rows)) => {
                     let visible_before = ui.visible();
                     let old_id = ui.selected_id(&visible_before);
-                    ui.rows = rows;
+                    ui.replace_rows(rows);
                     let visible_after = ui.keep_selection(old_id.clone());
                     let selection_changed = old_id.as_ref() != ui.selected_id(&visible_after).as_ref();
                     if ui.show_detail && selection_changed {
@@ -699,15 +774,18 @@ fn drive_ui(
                     Err(error) => ui.push_activity(format!("cannot create app: {error}")),
                 },
                 Ok(UiMsg::Activity(text)) => ui.push_activity(text),
+                Ok(UiMsg::Progress(progress)) => ui.progress = progress,
                 Ok(UiMsg::Finished) => ui.busy = ui.busy.saturating_sub(1),
                 Ok(UiMsg::Fatal(text)) => {
                     ui.worker_failed = true;
                     ui.busy = 0;
+                    ui.progress = None;
                     ui.push_activity(text);
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     ui.worker_failed = true;
                     ui.busy = 0;
+                    ui.progress = None;
                     ui.push_activity("worker stopped unexpectedly".into());
                     break;
                 }
@@ -742,7 +820,12 @@ fn handle_key(
     if ui.confirmation.is_some() {
         match key.code {
             KeyCode::Char('y') => confirm_action(ui, home, tx)?,
-            KeyCode::Char('n') | KeyCode::Esc => ui.confirmation = None,
+            KeyCode::Char('n') | KeyCode::Esc => {
+                ui.confirmation = None;
+                ui.confirmation_scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => ui.confirmation_scroll = ui.confirmation_scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => ui.confirmation_scroll = ui.confirmation_scroll.saturating_sub(1),
             _ => {}
         }
         return Ok(false);
@@ -827,6 +910,9 @@ fn handle_key(
                 request_events(ui, visible, tx);
             }
         }
+        KeyCode::Char(' ') => ui.toggle_mark(visible),
+        KeyCode::Char('s') => ui.confirm_marked_update(),
+        KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => ui.marked.clear(),
         KeyCode::Char('u') => {
             if let Some(id) = ui.selected_id(visible) {
                 ui.confirmation = Some(Confirmation::Update(id));
@@ -989,11 +1075,19 @@ fn confirm_action(ui: &mut UiState, home: Option<&Path>, tx: &mpsc::Sender<Cmd>)
     let Some(action) = ui.confirmation.take() else {
         return Ok(());
     };
+    ui.confirmation_scroll = 0;
     match action {
         Confirmation::Update(id) => send_command(ui, tx, Cmd::Update(id)),
         Confirmation::BulkUpdate(ids) => {
             if ids.is_empty() {
                 ui.push_activity("bulk update: no enabled update-available apps".into());
+            } else {
+                send_command(ui, tx, Cmd::UpdateMany(ids));
+            }
+        }
+        Confirmation::SelectedUpdate(ids) => {
+            if ids.iter().any(|id| !ui.rows.iter().any(|row| &row.app == id && row.enabled)) {
+                ui.push_activity("selected update cancelled: an app was removed or disabled; review selection".into());
             } else {
                 send_command(ui, tx, Cmd::UpdateMany(ids));
             }
@@ -1103,8 +1197,8 @@ fn draw_dashboard(f: &mut Frame, ui: &UiState, visible: &[usize]) {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "apps {}   updates {updates}   approvals {approvals}   errors {errors}   disabled {disabled}",
-            ui.rows.len()
+            "apps {}   marked {}   updates {updates}   approvals {approvals}   errors {errors}   disabled {disabled}",
+            ui.rows.len(), ui.marked.len()
         )),
         if ui.busy > 0 {
             Span::styled("   ⟳ working", Style::default().fg(Color::Yellow))
@@ -1121,7 +1215,9 @@ fn draw_dashboard(f: &mut Frame, ui: &UiState, visible: &[usize]) {
         Screen::NewApp => draw_form(f, areas[1], ui),
     }
 
-    let activity = if ui.activity.is_empty() {
+    let activity = if let Some((id, progress)) = &ui.progress {
+        progress_text(id, progress)
+    } else if ui.activity.is_empty() {
         ui.status_line.clone()
     } else {
         ui.activity.iter().cloned().collect::<Vec<_>>().join(" | ")
@@ -1135,7 +1231,7 @@ fn draw_dashboard(f: &mut Frame, ui: &UiState, visible: &[usize]) {
     } else {
         match ui.screen {
             Screen::Dashboard => {
-                "j/k/arrows move  PgUp/PgDn page  / search  f filter  r refresh  d history  u update  U bulk  a approve  e edit  n new  x delete  g/G desktop  p plugins  F1 help  q quit"
+                "j/k move  / search  f filter  r refresh  Space mark  s update marked  c clear  u update  U bulk  F1 help  q quit"
             }
             Screen::Help => "[Esc] return to dashboard",
             Screen::Plugins => "[Esc] return to dashboard",
@@ -1144,7 +1240,7 @@ fn draw_dashboard(f: &mut Frame, ui: &UiState, visible: &[usize]) {
     };
     f.render_widget(Paragraph::new(footer).style(Style::default().fg(Color::Gray)), areas[3]);
     if let Some(confirmation) = ui.confirmation.as_ref() {
-        draw_confirmation(f, confirmation);
+        draw_confirmation(f, confirmation, ui.confirmation_scroll);
     }
 }
 
@@ -1176,9 +1272,10 @@ fn draw_app_screen(f: &mut Frame, area: Rect, ui: &UiState, visible: &[usize]) {
         format!("  search: {search}")
     };
     let title = format!(
-        "apps — {} visible / {} configured · {}{search_label}",
+        "apps — {} visible / {} configured · {} marked · {}{search_label}",
         visible.len(),
         ui.rows.len(),
+        ui.marked.len(),
         ui.filter.label()
     );
     let header = Row::new(["ID", "PROVIDER", "INSTALLED", "LATEST", "STATUS"])
@@ -1201,7 +1298,7 @@ fn draw_app_screen(f: &mut Frame, area: Rect, ui: &UiState, visible: &[usize]) {
                 Style::default()
             };
             Row::new([
-                Cell::from(row.app.clone()),
+                Cell::from(format!("{} {}", if ui.marked.contains(&row.app) { "[x]" } else { "[ ]" }, row.app)),
                 Cell::from(row.provider.clone()),
                 Cell::from(row.installed.as_deref().unwrap_or("—").to_string()),
                 Cell::from(row.latest.as_deref().unwrap_or("—").to_string()),
@@ -1304,6 +1401,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("j/k, arrows: move; PageUp/PageDown: move by page"),
         Line::from("r: refresh; /: search ID/provider; f: cycle All, Updates, Approvals, Errors, Disabled"),
         Line::from("d: toggle selected app history; u: confirm selected update; U: confirm eligible bulk updates"),
+        Line::from("Space: toggle mark; s: update marked apps; c: clear marks (including hidden apps)"),
+        Line::from("Marks survive filters and refresh; removed apps are unmarked. Commands may update dependencies."),
         Line::from("a: confirm approval; e: edit config in $EDITOR; n: new app form; x: delete config only"),
         Line::from("g: write desktop entry; G: confirm desktop-entry removal; p: plugin catalog"),
         Line::from("F1: help; q or Ctrl-C: quit; confirmations use y, n, or Esc"),
@@ -1380,7 +1479,7 @@ fn format_label(format: crate::cli::ScaffoldFormat) -> &'static str {
     }
 }
 
-fn draw_confirmation(f: &mut Frame, confirmation: &Confirmation) {
+fn draw_confirmation(f: &mut Frame, confirmation: &Confirmation, scroll: u16) {
     let lines = match confirmation {
         Confirmation::Update(id) => vec![
             Line::styled("Confirm selected app update", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -1394,6 +1493,16 @@ fn draw_confirmation(f: &mut Frame, confirmation: &Confirmation) {
             Line::from(if ids.is_empty() { "No eligible apps.".into() } else { ids.join(", ") }),
             Line::from("[y] proceed   [n/Esc] cancel"),
         ],
+        Confirmation::SelectedUpdate(ids) => {
+            let mut lines = vec![
+                Line::styled("Confirm marked app updates", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Line::from("Commands may update dependencies or other packages."),
+                Line::from("[y] proceed   [n/Esc] cancel   [j/k] scroll"),
+                Line::from(format!("{} marked app(s), in ID order:", ids.len())),
+            ];
+            lines.extend(ids.iter().map(|id| Line::from(id.as_str())));
+            lines
+        },
         Confirmation::Approve(id) => vec![
             Line::styled("Approve changed build scripts", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Line::from(format!("app: {id}")),
@@ -1414,11 +1523,12 @@ fn draw_confirmation(f: &mut Frame, confirmation: &Confirmation) {
             Line::from("[y] remove   [n/Esc] cancel"),
         ],
     };
-    let height = (lines.len() as u16 + 2).min(f.area().height);
+    let height = (lines.len().saturating_add(2).min(usize::from(u16::MAX)) as u16).min(f.area().height);
     let area = centered_rect(75, height, f.area());
     f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(
         Paragraph::new(lines)
+            .scroll((scroll, 0))
             .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::ALL).title("confirmation"))
             .style(Style::default().bg(Color::Black)),
@@ -1482,6 +1592,55 @@ mod tests {
         let visible = ui.keep_selection(selected.clone());
         assert_eq!(ui.selected_id(&visible), selected);
         assert_eq!(ui.selected_id(&visible).as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn marked_apps_survive_filters_and_refresh_across_providers() {
+        let mut ui = UiState::default();
+        ui.rows = vec![row("apt-app", "apt", Status::Ok), row("flat-app", "flatpak", Status::UpdateAvailable)];
+        ui.toggle_mark(&ui.visible());
+        ui.selected = 1;
+        ui.toggle_mark(&ui.visible());
+        ui.search = "flat".into();
+        assert_eq!(ui.visible(), vec![1]);
+        ui.replace_rows(vec![row("flat-app", "flatpak", Status::Ok), row("apt-app", "apt", Status::Ok)]);
+        ui.confirm_marked_update();
+        let (tx, rx) = mpsc::channel();
+        confirm_action(&mut ui, None, &tx).unwrap();
+        match rx.try_recv().unwrap() {
+            Cmd::UpdateMany(ids) => assert_eq!(ids, vec!["apt-app", "flat-app"]),
+            _ => panic!("expected marked updates"),
+        }
+    }
+
+    #[test]
+    fn marked_confirmation_rejects_removed_or_disabled_apps() {
+        for removed in [true, false] {
+            let mut ui = UiState::default();
+            ui.rows = vec![row("demo", "apt", Status::Ok)];
+            ui.toggle_mark(&ui.visible());
+            ui.confirm_marked_update();
+            if removed {
+                ui.replace_rows(vec![]);
+                assert!(ui.marked.is_empty());
+            } else {
+                ui.rows[0].enabled = false;
+            }
+            let (tx, rx) = mpsc::channel();
+            confirm_action(&mut ui, None, &tx).unwrap();
+            assert!(rx.try_recv().is_err());
+            assert!(ui.status_line.contains("cancelled"));
+        }
+    }
+
+    #[test]
+    fn marking_toggles_and_empty_selection_does_not_confirm() {
+        let mut ui = UiState::default();
+        ui.rows = vec![row("demo", "flatpak", Status::Ok)];
+        ui.toggle_mark(&ui.visible());
+        ui.toggle_mark(&ui.visible());
+        ui.confirm_marked_update();
+        assert!(ui.confirmation.is_none());
     }
 
     #[test]
