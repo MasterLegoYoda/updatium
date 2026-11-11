@@ -84,7 +84,7 @@ async fn external_installer_copies_download_and_records_state() {
         "plugin action must reach the report verbatim: {rep:?}"
     );
     assert_eq!(
-        e.installed_version("ext").unwrap().as_deref(),
+        e.installed_version("ext").await.unwrap().as_deref(),
         Some("2024.06.12"),
         "installed version recorded"
     );
@@ -148,5 +148,5 @@ echo '{"protocol":1,"id":"oldplug"}'
         "{failed}"
     );
     assert!(!dest.exists(), "nothing may be installed on handshake failure");
-    assert!(e.installed_version("neg").unwrap().is_none());
+    assert!(e.installed_version("neg").await.unwrap().is_none());
 }

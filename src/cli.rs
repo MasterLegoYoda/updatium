@@ -176,7 +176,10 @@ pub fn render_table(rows: &[TableRow]) -> String {
                 p.clone(),
                 format_installed(i.version.as_deref(), i.source),
                 l.clone().unwrap_or_else(|| "—".into()),
-                status_str(s),
+                match &i.diagnostic {
+                    Some(diagnostic) if !matches!(s, Status::Error(error) if error.contains(diagnostic)) => format!("{}; {diagnostic}", status_str(s)),
+                    _ => status_str(s),
+                },
             ]
         })
         .collect();
@@ -247,7 +250,7 @@ fn report_rows(reports: &[CheckReport]) -> Vec<TableRow> {
             (
                 r.app.clone(),
                 r.provider.clone(),
-                InstalledInfo { version: r.installed.clone(), source: r.installed_source },
+                InstalledInfo { version: r.installed.clone(), source: r.installed_source, diagnostic: r.installed_diagnostic.clone() },
                 r.latest.clone(),
                 r.status.clone(),
             )
@@ -487,7 +490,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
         }
         Cmd::List { json } => {
             let e = Engine::new(cli.home.as_deref())?;
-            let rows = e.store_list()?;
+            let rows = tokio::runtime::Runtime::new()?.block_on(e.store_list())?;
             if *json || cli.json {
                 println!(
                     "{}",
@@ -498,7 +501,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                                 let pending = e.pending_update(&id)?;
                                 Ok(serde_json::json!({
                                     "id": id, "provider": p, "installed": i.version,
-                                    "installed_source": i.source, "update_pending": pending
+                                    "installed_source": i.source, "installed_diagnostic": i.diagnostic, "update_pending": pending
                                 }))
                             })
                             .collect::<Result<Vec<_>>>()?
@@ -510,6 +513,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                     .map(|(id, p, i)| {
                         let status = match e.pending_update(&id) {
                             Ok(Some(version)) => Status::Error(format!("update to {version} incomplete or running")),
+                            Ok(None) if i.diagnostic.is_some() => Status::Error(i.diagnostic.clone().unwrap()),
                             Ok(None) if i.source == InstalledSource::Unknown => Status::NeverChecked,
                             Ok(None) => Status::Ok,
                             Err(error) => Status::Error(format!("{error:#}")),
@@ -546,6 +550,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                             serde_json::json!({
                                 "app": r.app, "provider": r.provider,
                                 "installed": r.installed, "installed_source": r.installed_source,
+                                "installed_diagnostic": r.installed_diagnostic,
                                 "latest": r.latest,
                                 "status": match &r.status {
                                     Status::NeverChecked => "never_checked",

@@ -1,9 +1,9 @@
-//! Version ordering used everywhere a "latest" must be picked.
+//! Generic version ordering; apt uses Debian-specific ordering instead.
 //!
 //! SemVer tags (optionally prefixed with `v` or `V`), two-component
 //! versions, and zero-padded numeric cores share SemVer precedence.
-//! Other strings form a separate, lower-sorting class ordered naturally. A
-//! fixed class per string keeps comparisons transitive across mixed formats.
+//! Other strings form a separate, lower-sorting class ordered naturally. The
+//! engine rejects mixed classes before making update decisions.
 
 use std::cmp::Ordering;
 
@@ -16,6 +16,11 @@ pub fn cmp_version(a: &str, b: &str) -> Ordering {
         (None, Some(_)) => Ordering::Less,
         (None, None) => natural_cmp(a.as_bytes(), b.as_bytes()),
     }
+}
+
+/// Whether generic ordering compares both values using the same policy.
+pub fn same_version_class(a: &str, b: &str) -> bool {
+    semantic_version(a.trim()).is_some() == semantic_version(b.trim()).is_some()
 }
 
 fn semantic_version(tag: &str) -> Option<semver::Version> {

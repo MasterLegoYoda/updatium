@@ -64,7 +64,7 @@ test -f "$DEMO_TOML"
 
 # --- 2. check --all --json --------------------------------------------------
 CHECK_JSON=$("$BIN" check --all --json)
-echo "$CHECK_JSON" | grep -q '"latest": "2.1.0"' || { echo "FAIL check json:"; echo "$CHECK_JSON"; exit 1; }
+echo "$CHECK_JSON" | grep -q '"latest": "v2.1.0"' || { echo "FAIL check json:"; echo "$CHECK_JSON"; exit 1; }
 echo "$CHECK_JSON" | grep -q '"app": "demo"' || { echo "FAIL app missing:"; echo "$CHECK_JSON"; exit 1; }
 
 # --- 3. dry run mutates nothing ---------------------------------------------
@@ -78,7 +78,7 @@ APPIMG="$UPDATIUM_HOME/state/Applications/freecad-demo-2.1.0-x86_64.AppImage"
 test -f "$APPIMG"
 test -x "$APPIMG"
 test -f "$UPDATIUM_HOME/state/applications/updatium.demo.desktop"
-"$BIN" list --json | grep -q '"installed": "2.1.0"'
+"$BIN" list --json | grep -q '"installed": "v2.1.0"'
 "$BIN" history demo | grep -q download_done
 "$BIN" history demo | grep -q install_ok
 

@@ -41,7 +41,7 @@ async fn full_appimage_lifecycle() {
     // First check: never installed -> NeverChecked with latest known.
     let reports = e.check(None).await.unwrap();
     assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].latest.as_deref(), Some("2.1.0"));
+    assert_eq!(reports[0].latest.as_deref(), Some("v2.1.0"));
     assert!(matches!(reports[0].status, Status::NeverChecked));
 
     // Dry run prints a plan and mutates nothing.
@@ -67,7 +67,7 @@ async fn full_appimage_lifecycle() {
             .exists(),
         "dry run must not install"
     );
-    assert!(e.installed_version("demo").unwrap().is_none());
+    assert!(e.installed_version("demo").await.unwrap().is_none());
 
     // Real update installs the appimage + desktop + state.
     let progress = std::sync::Mutex::new(Vec::new());
@@ -88,8 +88,8 @@ async fn full_appimage_lifecycle() {
         .join("state/Applications/freecad-demo-2.1.0-x86_64.AppImage");
     assert!(installed_path.exists(), "{:?}", home.path().join("state"));
     assert_eq!(
-        e.installed_version("demo").unwrap().as_deref(),
-        Some("2.1.0")
+        e.installed_version("demo").await.unwrap().as_deref(),
+        Some("v2.1.0")
     );
     let reports = e.check(None).await.unwrap();
     assert_eq!(reports[0].installed_source, InstalledSource::Recorded);
@@ -128,7 +128,7 @@ async fn full_appimage_lifecycle() {
     assert_eq!(reports[0].installed_source, InstalledSource::Unknown);
     let rep = e.update("demo", &UpdateOpts::default()).await.unwrap();
     assert!(rep.failed.is_none(), "{rep:?}");
-    assert_eq!(rep.to.as_deref(), Some("2.1.0"));
+    assert_eq!(rep.to.as_deref(), Some("v2.1.0"));
     assert!(installed_path.exists());
 }
 
@@ -161,13 +161,13 @@ type = "none"
     // Record the prerelease 2.0.0 as the newest known version.
     write(r"^v?2\.0\.0$", true);
     let reports = e.check(None).await.unwrap();
-    assert_eq!(reports[0].latest.as_deref(), Some("2.0.0"));
+    assert_eq!(reports[0].latest.as_deref(), Some("v2.0.0"));
 
     // Tighten the filter so 2.0.0 is no longer advertised. The report must
     // follow the current result set (1.8.0), not the all-time DB maximum.
     write(r"^v?1\.8\.0$", false);
     let reports = e.check(None).await.unwrap();
-    assert_eq!(reports[0].latest.as_deref(), Some("1.8.0"));
+    assert_eq!(reports[0].latest.as_deref(), Some("v1.8.0"));
 }
 
 #[tokio::test]
@@ -196,10 +196,10 @@ type = "none"
     // No DB state: the configured command supplies the installed version.
     let reports = e.check(None).await.unwrap();
     assert_eq!(reports[0].installed.as_deref(), Some("2.0.0"));
-    assert_eq!(reports[0].latest.as_deref(), Some("2.1.0"));
+    assert_eq!(reports[0].latest.as_deref(), Some("v2.1.0"));
     assert!(matches!(reports[0].status, Status::UpdateAvailable));
     assert_eq!(
-        e.installed_version("demo").unwrap().as_deref(),
+        e.installed_version("demo").await.unwrap().as_deref(),
         Some("2.0.0")
     );
 
@@ -216,7 +216,7 @@ type = "none"
         .await
         .unwrap();
     assert_eq!(rep.from.as_deref(), Some("2.0.0"));
-    assert_eq!(rep.to.as_deref(), Some("2.1.0"));
+    assert_eq!(rep.to.as_deref(), Some("v2.1.0"));
 }
 
 #[tokio::test]
@@ -259,8 +259,11 @@ type = "none"
         let reports = e.check(None).await.unwrap();
         assert_eq!(reports[0].installed, None);
         assert_eq!(reports[0].installed_source, InstalledSource::Unknown);
+        let diagnostic = reports[0].installed_diagnostic.as_deref().unwrap();
+        assert!(diagnostic.contains("probe"), "{diagnostic}");
+        assert!(matches!(&reports[0].status, Status::Error(error) if error.contains(diagnostic)));
         let update = e.update("demo", &UpdateOpts::default()).await.unwrap();
-        assert!(update.failed.is_some(), "{update:?}");
+        assert!(update.failed.as_deref().unwrap().contains(diagnostic), "{update:?}");
     }
 
     std::fs::write(&version, "1.0.0\n").unwrap();
@@ -318,7 +321,7 @@ type = "none"
         "{events:?}"
     );
     // And no state was recorded.
-    assert!(e.installed_version("poison").unwrap().is_none());
+    assert!(e.installed_version("poison").await.unwrap().is_none());
 }
 
 const SRC_APP_TMPL: &str = r#"
@@ -426,7 +429,7 @@ type = "dir"
     assert_eq!(reports[0].latest.as_deref(), Some("b2000"));
     assert!(matches!(reports[0].status, Status::UpdateAvailable));
     assert_eq!(
-        e.installed_version("srcdemo").unwrap().as_deref(),
+        e.installed_version("srcdemo").await.unwrap().as_deref(),
         Some("b1000")
     );
 }
@@ -458,7 +461,7 @@ type = "dir"
     let first = e.update("srcdemo", &UpdateOpts::default()).await.unwrap();
     assert!(first.failed.is_none(), "{first:?}");
     assert_eq!(std::fs::read(destination.join("tool")).unwrap(), b"new");
-    assert_eq!(e.installed_version("srcdemo").unwrap().as_deref(), Some("b2000"));
+    assert_eq!(e.installed_version("srcdemo").await.unwrap().as_deref(), Some("b2000"));
 
     // A successful install command that removes its staging directory forces
     // the subsequent atomic activation to fail, after the old install exists.
@@ -466,7 +469,7 @@ type = "dir"
     let failed = e.update("srcdemo", &UpdateOpts { force: true, ..Default::default() }).await.unwrap();
     assert!(failed.failed.as_deref().unwrap().contains("activating"), "{failed:?}");
     assert_eq!(std::fs::read(destination.join("tool")).unwrap(), b"new");
-    assert_eq!(e.installed_version("srcdemo").unwrap().as_deref(), Some("b2000"));
+    assert_eq!(e.installed_version("srcdemo").await.unwrap().as_deref(), Some("b2000"));
 
     std::fs::remove_dir_all(&destination).unwrap();
     let checked = e.check(None).await.unwrap();
@@ -504,7 +507,7 @@ async fn source_build_gate_blocks_changed_scripts_until_approved() {
     let out = home.path().join("state/installs/srcdemo/current/out.txt");
     assert_eq!(std::fs::read(&out).unwrap(), b"build me v1\n");
     assert_eq!(
-        e.installed_version("srcdemo").unwrap().as_deref(),
+        e.installed_version("srcdemo").await.unwrap().as_deref(),
         Some("b2000")
     );
     let old_hash = e.script_hash_of("srcdemo").unwrap();
@@ -567,7 +570,7 @@ async fn source_build_gate_blocks_changed_scripts_until_approved() {
     let rep = e.update("srcdemo", &UpdateOpts::default()).await.unwrap();
     assert!(rep.failed.is_none(), "{rep:?}");
     assert_eq!(
-        e.installed_version("srcdemo").unwrap().as_deref(),
+        e.installed_version("srcdemo").await.unwrap().as_deref(),
         Some("b3000")
     );
     assert_eq!(std::fs::read(&out).unwrap(), b"build me EVIL v2\n");

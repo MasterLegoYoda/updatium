@@ -58,7 +58,7 @@ type = "appimage"
     let failure = bad.failed.as_deref().unwrap();
     assert!(failure.contains("digest mismatch"), "{failure}");
     assert!(!bad.installed);
-    assert!(engine.installed_version("bad").unwrap().is_none());
+    assert!(engine.installed_version("bad").await.unwrap().is_none());
     let events = engine.history(Some("bad"), 100).unwrap();
     let detail = events.iter().find(|event| event.kind == "verify_failed").unwrap().detail.as_ref().unwrap();
     let detail: serde_json::Value = serde_json::from_str(detail).unwrap();

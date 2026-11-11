@@ -105,6 +105,81 @@ fn expand_argv(argv: &[String]) -> Vec<String> {
         .collect()
 }
 
+async fn terminate_and_reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    // On failure or a stalled wait, kill-on-drop and Tokio's background
+    // reaping remain best effort. Do not extend the deadline indefinitely.
+    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+}
+
+/// Execute an installed-version probe with bounded output and runtime.
+///
+/// Only the direct child is killed on failure or cancellation; descendants may
+/// survive. The deadline also covers pipes kept open by those descendants.
+pub async fn run_probe(cmd: &[String]) -> Result<String> {
+    const LIMIT: usize = 64 * 1024;
+    const DEADLINE: Duration = Duration::from_secs(3);
+
+    if cmd.is_empty() {
+        bail!("refusing to execute empty probe command");
+    }
+    let expanded = expand_argv(cmd);
+    let mut command = tokio::process::Command::new(&expanded[0]);
+    command.args(&expanded[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()
+        .with_context(|| format!("spawning probe {}", expanded[0]))?;
+
+    async fn read_probe_stream<R: tokio::io::AsyncRead + Unpin>(
+        mut pipe: R,
+        name: &str,
+    ) -> Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = pipe.read(&mut chunk).await.with_context(|| format!("reading probe {name}"))?;
+            if n == 0 {
+                return Ok(output);
+            }
+            if n > LIMIT - output.len() {
+                bail!("probe {name} exceeded the {LIMIT}-byte output limit");
+            }
+            output.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    // Piped handles are guaranteed by the command configuration above.
+    let stdout = child.stdout.take().expect("piped probe stdout");
+    let stderr = child.stderr.take().expect("piped probe stderr");
+    let result = tokio::time::timeout(DEADLINE, async {
+        tokio::try_join!(
+            async { child.wait().await.context("waiting for probe") },
+            read_probe_stream(stdout, "stdout"),
+            read_probe_stream(stderr, "stderr"),
+        )
+    }).await;
+
+    let (status, stdout, stderr) = match result {
+        Ok(Ok(result)) => result,
+        other => {
+            terminate_and_reap(&mut child).await;
+            match other {
+                Err(_) => bail!("probe timed out after {} seconds", DEADLINE.as_secs()),
+                Ok(Err(err)) => return Err(err),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    };
+    if !status.success() {
+        bail!("probe exited with {status}; stderr: {}", String::from_utf8_lossy(&stderr));
+    }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
 /// Execute `cmd` directly (argv vector, NEVER through a shell).
 ///
 /// With `capture`, stdout/stderr are collected (tails kept, capped at 200
@@ -314,10 +389,9 @@ async fn run_impl_proxy(
     match tokio::time::timeout(timeout, wait_fut).await {
         Ok(res) => res,
         Err(_) => {
-            // Best-effort kill; ignore races with an already-exited child.
-            let _ = child.start_kill();
+            terminate_and_reap(&mut child).await;
             bail!(
-                "command timed out after {:?} and was killed: {}",
+                "command timed out after {:?} and termination was requested: {}",
                 timeout,
                 expanded.join(" ")
             )

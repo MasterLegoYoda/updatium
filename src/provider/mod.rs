@@ -327,22 +327,6 @@ pub(crate) fn is_executable_file(p: &std::path::Path) -> bool {
 // Shared helpers used by multiple providers
 // ---------------------------------------------------------------------------
 
-/// Derive a display version from a tag: strip one leading `v`/`V` only when the
-/// remainder is a non-empty digit-dot string; otherwise keep the tag verbatim.
-pub fn version_from_tag(tag: &str) -> String {
-    for prefix in ["v", "V"] {
-        if let Some(rest) = tag.strip_prefix(prefix) {
-            let ok = !rest.is_empty()
-                && rest.bytes().any(|b| b.is_ascii_digit())
-                && rest.bytes().all(|b| b.is_ascii_digit() || b == b'.');
-            if ok {
-                return rest.to_string();
-            }
-        }
-    }
-    tag.to_string()
-}
-
 /// Validate and normalize a digest string ("sha256:<hex>", hex lowercased).
 pub fn normalize_digest(raw: &str) -> Option<String> {
     let hex = raw.strip_prefix("sha256:")?;
@@ -368,15 +352,6 @@ pub fn parse_sums_line(line: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn version_tag_stripping() {
-        assert_eq!(version_from_tag("v1.2.3"), "1.2.3");
-        assert_eq!(version_from_tag("2024.06.12"), "2024.06.12");
-        assert_eq!(version_from_tag("b1234"), "b1234");
-        assert_eq!(version_from_tag("v"), "v");
-        assert_eq!(version_from_tag("v1.0.0-beta"), "v1.0.0-beta");
-    }
 
     #[test]
     fn digest_normalization() {

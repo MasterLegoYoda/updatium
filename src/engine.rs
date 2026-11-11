@@ -57,6 +57,7 @@ pub enum InstalledSource {
 pub struct InstalledInfo {
     pub version: Option<String>,
     pub source: InstalledSource,
+    pub diagnostic: Option<String>,
 }
 
 
@@ -66,6 +67,7 @@ pub struct CheckReport {
     pub provider: String,
     pub installed: Option<String>,
     pub installed_source: InstalledSource,
+    pub installed_diagnostic: Option<String>,
     pub latest: Option<String>,
     pub status: Status,
 }
@@ -104,6 +106,42 @@ pub struct UpdateReport {
     /// Set when the pipeline stopped with a failure (drives exit code 2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed: Option<String>,
+}
+
+pub(crate) fn compare_app_versions(kind: &SourceKind, a: &str, b: &str) -> std::cmp::Ordering {
+    if matches!(kind, SourceKind::Apt(_)) {
+        provider::apt::compare_versions(a, b)
+    } else {
+        cmp_version(a, b)
+    }
+}
+
+pub(crate) fn ensure_same_version_class(kind: &SourceKind, a: &str, b: &str) -> Result<()> {
+    if matches!(kind, SourceKind::Apt(_)) {
+        for version in [a, b] {
+            if !provider::apt::valid_version(version) {
+                bail!("invalid Debian version {version:?}; configure installed_version_cmd to return the full package version including epoch and revision");
+            }
+        }
+    } else if !crate::version::same_version_class(a, b) {
+        bail!("incompatible version formats {a:?} and {b:?}; constrain releases with tag_regex, ref_regex, version_capture, or branch_regex and ensure installed_version_cmd uses the same format");
+    }
+    Ok(())
+}
+
+fn validate_versions(app: &AppFile, releases: &[Release], installed: Option<&str>) -> Result<()> {
+    if let Some(first) = releases.first() {
+        if matches!(app.source_kind, SourceKind::Apt(_)) {
+            ensure_same_version_class(&app.source_kind, &first.version, &first.version)?;
+        }
+        for release in &releases[1..] {
+            ensure_same_version_class(&app.source_kind, &first.version, &release.version)?;
+        }
+        if let Some(installed) = installed {
+            ensure_same_version_class(&app.source_kind, &first.version, installed)?;
+        }
+    }
+    Ok(())
 }
 
 pub struct Engine {
@@ -199,9 +237,13 @@ impl Engine {
         // Phase 2: sequential state writes + status computation.
         let mut reports = Vec::with_capacity(fetched.len());
         for (app, res) in fetched {
-            let info = self.installed_info(&app);
+            let info = self.installed_info(&app).await;
             let installed = info.version;
             let pending = self.is_pending_approval(&app.id).unwrap_or(false);
+            let res = res.and_then(|releases| {
+                validate_versions(&app, &releases, installed.as_deref())?;
+                Ok(releases)
+            });
 
             match res {
                 Err(e) => {
@@ -213,12 +255,13 @@ impl Engine {
                         provider: app.provider,
                         installed,
                         installed_source: info.source,
+                        installed_diagnostic: info.diagnostic,
                         latest: None,
                         status: Status::Error(msg),
                     });
                 }
                 Ok(mut releases) => {
-                    releases.sort_by(|a, b| cmp_version(&b.version, &a.version));
+                    releases.sort_by(|a, b| compare_app_versions(&app.source_kind, &b.version, &a.version));
                     releases.dedup_by(|a, b| a.version == b.version);
                     let versions: Vec<String> =
                         releases.iter().map(|r| r.version.clone()).collect();
@@ -239,13 +282,13 @@ impl Engine {
                         Status::Error(format!("update to {version} is incomplete or still running; installed state may be stale"))
                     } else if pending {
                         Status::NeedsApproval
-                    } else if app.installed_version_cmd.is_some() && info.source == InstalledSource::Unknown {
-                        Status::Error("installed-version probe failed or returned no version; installed state is unknown".into())
+                    } else if let Some(diagnostic) = &info.diagnostic {
+                        Status::Error(diagnostic.clone())
                     } else {
                         match (&installed, &latest) {
                             (_, None) => Status::NeverChecked,
                             (None, Some(_)) => Status::NeverChecked,
-                            (Some(i), Some(l)) => match cmp_version(l, i) {
+                            (Some(i), Some(l)) => match compare_app_versions(&app.source_kind, l, i) {
                                 std::cmp::Ordering::Greater => {
                                     let _ = self.store.event(
                                         "update_available",
@@ -268,6 +311,7 @@ impl Engine {
                         provider: app.provider,
                         installed,
                         installed_source: info.source,
+                        installed_diagnostic: info.diagnostic,
                         latest,
                         status,
                     });
@@ -357,14 +401,14 @@ impl Engine {
         if let Some(version) = &pending {
             if !o.force && !o.dry_run {
                 return Ok(UpdateReport {
-                    app: id.to_owned(), from: self.installed_for(&app), to: Some(version.clone()),
-                    failed: Some(format!("previous update to {version} was interrupted; installation state is uncertain. Inspect the installation and history, then use --force to retry")),
+                    app: id.to_owned(), from: self.installed_for(&app).await, to: Some(version.clone()),
+                    failed: Some(format!("previous update to {version} failed or was interrupted; installation state is uncertain. Inspect the installation and history, then use --force to retry")),
                     ..Default::default()
                 });
             }
         }
 
-        let info = self.installed_info(&app);
+        let info = self.installed_info(&app).await;
         let from = info.version;
         let track_only = match &app.source_kind {
             SourceKind::Command(c) => c.apply_cmd.is_none(),
@@ -376,16 +420,26 @@ impl Engine {
         if !track_only && app.installed_version_cmd.is_some() && info.source == InstalledSource::Unknown && !o.force && !o.dry_run {
             return Ok(UpdateReport {
                 app: id.to_owned(), from: None,
-                failed: Some("installed-version probe failed or returned no version; installation state is unknown. Fix the probe or use --force after inspection".into()),
+                failed: Some(format!("{}. Fix the probe or use --force after inspection", info.diagnostic.as_deref().unwrap_or("installed state is unknown"))),
                 ..Default::default()
             });
         }
+        let probe_warnings: Vec<String> = info.diagnostic.into_iter().collect();
 
-        let mut releases = self
-            .check_one_versions(&app)
-            .await
-            .with_context(|| format!("checking '{id}'"))?;
-        releases.sort_by(|a, b| cmp_version(&b.version, &a.version));
+        let mut releases = match self.check_one_versions(&app).await {
+            Ok(releases) => releases,
+            Err(error) => return Ok(UpdateReport {
+                app: id.to_owned(), from, warnings: probe_warnings,
+                failed: Some(format!("checking '{id}': {error:#}")), ..Default::default()
+            }),
+        };
+        if let Err(error) = validate_versions(&app, &releases, from.as_deref()) {
+            return Ok(UpdateReport {
+                app: id.to_owned(), from, warnings: probe_warnings,
+                failed: Some(format!("{error:#}")), ..Default::default()
+            });
+        }
+        releases.sort_by(|a, b| compare_app_versions(&app.source_kind, &b.version, &a.version));
         releases.dedup_by(|a, b| a.version == b.version);
 
         let target: Release = {
@@ -397,7 +451,7 @@ impl Engine {
                 // Otherwise only strictly newer than installed.
                 (Some(i), _) => releases
                     .iter()
-                    .find(|r| cmp_version(&r.version, i) == std::cmp::Ordering::Greater)
+                    .find(|r| compare_app_versions(&app.source_kind, &r.version, i) == std::cmp::Ordering::Greater)
                     .cloned(),
             };
             match chosen {
@@ -406,6 +460,7 @@ impl Engine {
                     return Ok(UpdateReport {
                         app: id.to_owned(), from: from.clone(), to: pending.clone(),
                         failed: Some("cannot reconcile interrupted update: provider returned no release to retry".into()),
+                        warnings: probe_warnings,
                         ..Default::default()
                     });
                 }
@@ -419,7 +474,7 @@ impl Engine {
                         recorded: false,
                         integration_failures: vec![],
                         actions: vec!["nothing to do".into()],
-                        warnings: vec![],
+                        warnings: probe_warnings,
                         failed: None,
                     });
                 }
@@ -435,7 +490,7 @@ impl Engine {
             recorded: false,
             integration_failures: vec![],
             actions: vec![],
-            warnings: vec![],
+            warnings: probe_warnings,
             failed: None,
         };
 
@@ -470,17 +525,22 @@ impl Engine {
             Some(&serde_json::json!({"to": target.version}).to_string()),
         )?;
 
-        let result = self.pipeline(&app, &target, &mut rep, progress).await;
+        let mut effects_started = false;
+        let result = self.pipeline(&app, &target, &mut rep, progress, &mut effects_started).await;
         if let Err(error) = result {
             let msg = format!("{error:#}");
             if rep.installed {
                 self.integration_failure(&app.id, &mut rep, format!("post-install completion: {msg}"));
             } else {
-                rep.failed = Some(format!("{msg} (installation may have changed; no rollback is implied)"));
+                rep.failed = Some(if effects_started {
+                    format!("{msg} (installation may have changed; no rollback is implied). Inspect the installation and history before retrying with --force")
+                } else {
+                    format!("{msg} (installation may have changed; no rollback is implied)")
+                });
                 let _ = self.store.event("install_failed", Some(id), Some(&msg));
             }
         }
-        if (pending.is_none() || rep.failed.is_none()) && (!rep.installed || rep.recorded) {
+        if (pending.is_none() || rep.failed.is_none()) && (!effects_started || rep.failed.is_none()) && (!rep.installed || rep.recorded) {
             if let Err(error) = self.store.finish_update(id) {
                 let detail = format!("could not finalize update bookkeeping: {error:#}; inspect the installation and retry with --force");
                 if rep.installed {
@@ -602,14 +662,16 @@ impl Engine {
         target: &Release,
         rep: &mut UpdateReport,
         progress: ProgressCallback<'_>,
+        effects_started: &mut bool,
     ) -> Result<()> {
         match &app.source_kind {
             SourceKind::SourceBuild(sb) => {
                 // Steps 5-7: no downloadable assets; checkout + gate + build.
-                return self.build_and_install_source(app, sb, target, rep, progress).await;
+                return self.build_and_install_source(app, sb, target, rep, progress, effects_started).await;
             }
             SourceKind::Command(c) => {
                 let apply = c.apply_cmd.as_ref().context("missing apply_cmd")?;
+                *effects_started = true;
                 progress(UpdateProgress::Stage("Installing"));
                 let vars = BTreeMap::from([("version", target.version.as_str())]);
                 let argv = exec::substitute(apply, &vars)?;
@@ -618,16 +680,19 @@ impl Engine {
                 return self.record_install(app, rep, None);
             }
             SourceKind::DockerRegistry(d) => {
+                *effects_started = true;
                 progress(UpdateProgress::Stage("Applying Docker update"));
                 self.apply_docker(app, d, target, rep).await?;
                 return self.record_install(app, rep, None);
             }
             SourceKind::Apt(c) => {
+                *effects_started = true;
                 progress(UpdateProgress::Stage("Applying apt update"));
                 self.apply_apt(app, c, target, rep).await?;
                 return self.record_install(app, rep, None);
             }
             SourceKind::Flatpak(f) => {
+                *effects_started = true;
                 progress(UpdateProgress::Stage("Applying Flatpak update"));
                 self.apply_flatpak(app, f, target, rep).await?;
                 return self.record_install(app, rep, None);
@@ -748,6 +813,7 @@ impl Engine {
             home: &self.home,
             on_extracted: Some(&on_extracted),
         };
+        *effects_started = true;
         let outcome = inst.install(&ctx).await?;
         self.finalize_installer_outcome(app, outcome, rep)
     }
@@ -817,6 +883,7 @@ impl Engine {
         target: &Release,
         rep: &mut UpdateReport,
         progress: ProgressCallback<'_>,
+        effects_started: &mut bool,
     ) -> Result<()> {
         // Step 5: checkout + integrity gate.
         progress(UpdateProgress::Stage("Fetching and checking out source"));
@@ -866,6 +933,7 @@ impl Engine {
         // Persist the now-approved script state so future gates can diff
         // against exactly these bytes.
         hash::save_snapshot(&self.home.script_snapshots().join(&app.id), &bundle, &files)?;
+        *effects_started = true;
 
         // Step 6: build steps sequentially.
         progress(UpdateProgress::Stage("Building"));
@@ -1106,32 +1174,37 @@ impl Engine {
 
     /// Observe an explicit probe on every read; otherwise report historical
     /// installation state without presenting it as a current observation.
-    pub fn installed_info(&self, app: &AppFile) -> InstalledInfo {
-        if app.installed_version_cmd.is_some() {
-            return match self.detect_installed_version_cmd(app) {
-                Some(version) => InstalledInfo { version: Some(version), source: InstalledSource::Observed },
-                None => InstalledInfo { version: None, source: InstalledSource::Unknown },
+    pub async fn installed_info(&self, app: &AppFile) -> InstalledInfo {
+        if let Some(argv) = &app.installed_version_cmd {
+            let result = exec::run_probe(argv).await.and_then(|output| {
+                output.lines().map(str::trim).find(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("probe returned no nonempty stdout line"))
+            });
+            return match result {
+                Ok(version) => InstalledInfo { version: Some(version), source: InstalledSource::Observed, diagnostic: None },
+                Err(error) => InstalledInfo { version: None, source: InstalledSource::Unknown, diagnostic: Some(format!("installed-version probe failed: {error:#}; installed state is unknown")) },
             };
         }
         let recorded = match self.store.state(&app.id) {
             Ok(state) => state.and_then(|s| s.installed_version),
-            Err(_) => return InstalledInfo { version: None, source: InstalledSource::Unknown },
+            Err(_) => return InstalledInfo { version: None, source: InstalledSource::Unknown, diagnostic: None },
         };
         if let Some(version) = recorded {
             let target = match self.store.install_target(&app.id) {
                 Ok(target) => target.or_else(|| self.legacy_install_target(app)),
-                Err(_) => return InstalledInfo { version: None, source: InstalledSource::Unknown },
+                Err(_) => return InstalledInfo { version: None, source: InstalledSource::Unknown, diagnostic: None },
             };
             if let Some((path, is_dir)) = target {
                 if !(if is_dir { path.is_dir() } else { path.is_file() }) {
-                    return InstalledInfo { version: None, source: InstalledSource::Unknown };
+                    return InstalledInfo { version: None, source: InstalledSource::Unknown, diagnostic: None };
                 }
             }
-            return InstalledInfo { version: Some(version), source: InstalledSource::Recorded };
+            return InstalledInfo { version: Some(version), source: InstalledSource::Recorded, diagnostic: None };
         }
         match self.detect_source_build_version(app) {
-            Some(version) => InstalledInfo { version: Some(version), source: InstalledSource::Inferred },
-            None => InstalledInfo { version: None, source: InstalledSource::Unknown },
+            Some(version) => InstalledInfo { version: Some(version), source: InstalledSource::Inferred, diagnostic: None },
+            None => InstalledInfo { version: None, source: InstalledSource::Unknown, diagnostic: None },
         }
     }
     fn legacy_install_target(&self, app: &AppFile) -> Option<(PathBuf, bool)> {
@@ -1146,37 +1219,8 @@ impl Engine {
         None
     }
 
-    pub fn installed_for(&self, app: &AppFile) -> Option<String> {
-        self.installed_info(app).version
-    }
-
-    /// Run the app's `installed_version_cmd` and take the first non-empty
-    /// stdout line as the installed version. Failures mean "unknown", never an
-    /// error: detection is best-effort and must not break check/list.
-    fn detect_installed_version_cmd(&self, app: &AppFile) -> Option<String> {
-        let argv = app.installed_version_cmd.as_ref()?;
-        let (program, args) = argv.split_first()?;
-        if program.trim().is_empty() {
-            return None;
-        }
-        let program = crate::config::expand_tilde(program);
-        let args: Vec<std::path::PathBuf> = args
-            .iter()
-            .map(|a| crate::config::expand_tilde(a))
-            .collect();
-        let out = std::process::Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(str::to_string)
+    pub async fn installed_for(&self, app: &AppFile) -> Option<String> {
+        self.installed_info(app).await.version
     }
 
     /// Derive the installed version of a source-build app from the tag checked
@@ -1212,15 +1256,15 @@ impl Engine {
             .lines()
             .map(str::trim)
             .filter(|tag| !tag.is_empty() && re.is_match(&format!("refs/tags/{tag}")))
-            .map(provider::version_from_tag)
+            .map(str::to_owned)
             .collect();
         versions.sort_by(|a, b| cmp_version(a, b));
         versions.pop()
     }
 
-    pub fn installed_version(&self, id: &str) -> Result<Option<String>> {
+    pub async fn installed_version(&self, id: &str) -> Result<Option<String>> {
         if let Some(app) = self.load_apps()?.into_iter().find(|a| a.id == id) {
-            return Ok(self.installed_for(&app));
+            return Ok(self.installed_for(&app).await);
         }
         Ok(self.store.state(id)?.and_then(|s| s.installed_version))
     }
@@ -1234,7 +1278,23 @@ impl Engine {
     }
 
     pub fn latest_known_pub(&self, id: &str) -> Result<Option<String>> {
-        self.store.latest_known(id)
+        if let Some(error) = self.store.state(id)?.and_then(|state| state.last_error) {
+            bail!("last check failed: {error}");
+        }
+        let apps = self.load_apps()?;
+        let Some(app) = apps.iter().find(|app| app.id == id) else {
+            return self.store.latest_known(id);
+        };
+        let versions = self.store.known_versions(id)?;
+        if let Some(first) = versions.first() {
+            if matches!(app.source_kind, SourceKind::Apt(_)) {
+                ensure_same_version_class(&app.source_kind, first, first)?;
+            }
+            for version in &versions[1..] {
+                ensure_same_version_class(&app.source_kind, first, version)?;
+            }
+        }
+        Ok(versions.into_iter().max_by(|a, b| compare_app_versions(&app.source_kind, a, b)))
     }
 
     /// A durable marker remains until the update finishes or is explicitly retried.
@@ -1243,7 +1303,7 @@ impl Engine {
     }
 
     /// (id, provider, installed) rows for `updatium list` and the TUI frame.
-    pub fn store_list(&self) -> Result<Vec<(String, String, InstalledInfo)>> {
+    pub async fn store_list(&self) -> Result<Vec<(String, String, InstalledInfo)>> {
         let apps: std::collections::HashMap<String, AppFile> = self
             .load_apps()?
             .into_iter()
@@ -1252,15 +1312,15 @@ impl Engine {
         let mut out = Vec::new();
         for a in self.store.list_apps()? {
             let installed = match apps.get(&a.id) {
-                Some(app) => self.installed_info(app),
+                Some(app) => self.installed_info(app).await,
                 None => {
                     let version = self.store.state(&a.id)?.and_then(|s| s.installed_version);
                     let target = self.store.install_target(&a.id)?;
                     let exists = target.as_ref().is_none_or(|(p, is_dir)| if *is_dir { p.is_dir() } else { p.is_file() });
                     if exists && version.is_some() {
-                        InstalledInfo { version, source: InstalledSource::Recorded }
+                        InstalledInfo { version, source: InstalledSource::Recorded, diagnostic: None }
                     } else {
-                        InstalledInfo { version: None, source: InstalledSource::Unknown }
+                        InstalledInfo { version: None, source: InstalledSource::Unknown, diagnostic: None }
                     }
                 }
             };

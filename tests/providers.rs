@@ -54,7 +54,7 @@ async fn github_pagination_filters_and_digests() {
     versions.sort();
     assert_eq!(
         versions,
-        vec!["1.8.0", "2.1.0"],
+        vec!["v1.8.0", "v2.1.0"],
         "draft+prerelease filtered"
     );
 
@@ -62,10 +62,10 @@ async fn github_pagination_filters_and_digests() {
     let rels_pre = gh_check(&base, true).await.unwrap();
     let mut versions: Vec<&str> = rels_pre.iter().map(|r| r.version.as_str()).collect();
     versions.sort();
-    assert_eq!(versions, vec!["1.8.0", "2.0.0", "2.1.0"]);
+    assert_eq!(versions, vec!["v1.8.0", "v2.0.0", "v2.1.0"]);
 
     // Digest from inline `digest` field.
-    let r210 = rels.iter().find(|r| r.version == "2.1.0").unwrap();
+    let r210 = rels.iter().find(|r| r.version == "v2.1.0").unwrap();
     assert_eq!(r210.assets.len(), 1, "asset_regex keeps only AppImages");
     assert_eq!(
         r210.assets[0].digest_hex(),
@@ -77,7 +77,7 @@ async fn github_pagination_filters_and_digests() {
     );
 
     // Digest from sibling SHA256SUMS asset (no inline digest).
-    let r180 = rels.iter().find(|r| r.version == "1.8.0").unwrap();
+    let r180 = rels.iter().find(|r| r.version == "v1.8.0").unwrap();
     assert_eq!(
         r180.assets[0].digest_hex(),
         Some(sha(b"fixture-appimage-bytes-1.8.0").as_str())
@@ -105,6 +105,20 @@ async fn github_regex_no_match_yields_empty() {
         rels.is_empty(),
         "regex-no-match must be empty vec, not error"
     );
+}
+
+#[tokio::test]
+async fn github_tag_filter_does_not_match_release_display_name() {
+    let (base, _guard) = common::spawn().await;
+    let cfg = GithubReleasesCfg {
+        tag_regex: Some(r"^Demo".into()),
+        ..gh_cfg(&base, false)
+    };
+    let http = net::build_client().unwrap();
+    let releases = GithubReleases::new(vec![])
+        .check(&app(SourceKind::GithubReleases(cfg), false), &http)
+        .await.unwrap();
+    assert!(releases.is_empty(), "{releases:?}");
 }
 
 #[tokio::test]

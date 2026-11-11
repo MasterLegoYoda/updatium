@@ -131,11 +131,13 @@ running an update, Updatium records a pending operation; after the file cutover
 it records the installed version and `install_ok` together in one database
 transaction, before attempting desktop or symlink integration. A crash between
 cutover and that transaction can leave the recorded version stale; a crash
-afterward can leave integration incomplete. On the next `list` or `check`, the
+afterward can leave integration incomplete. A reported failure after a build,
+installer, or apply operation starts also retains the pending marker because the
+operation may already have changed files. On the next `list` or `check`, the
 pending update is reported as incomplete or still running. A normal `update`
 refuses to guess what happened. Inspect the actual installation and history,
 then use `updatium update <id> --force` to retry the current latest release;
-the marker clears after the retry completes. Retrying user-supplied commands or
+the marker clears after a successful retry. Retrying user-supplied commands or
 external plugins can repeat side effects, so inspect those before forcing.
 
 Updates and approvals for the same app ID under the same Updatium home use a
@@ -146,13 +148,16 @@ not protect files from unrelated programs, different Updatium homes, or differen
 app IDs configured to share a checkout or installation target. Avoid sharing
 those paths across concurrently updated apps.
 
-Cancelling a running Updatium command future kills its direct child, but a
-process crash or forced termination can leave commands, plugins, or their
-descendants running after Updatium's lock is released. Before forcing a retry or
-removing staging, partial downloads, or an incomplete source checkout, inspect
-for and stop any surviving work; preserve local checkout changes. An interrupted
-clone may leave a non-git directory that must be inspected and moved or removed
-manually before retrying. Never delete lock files to stop a running operation.
+Cancelling a running Updatium command future requests termination of its direct
+child. On timeout, Updatium also waits up to one second for the child to be
+reaped; cleanup after that is best effort. Descendants are not tracked or killed
+and can continue modifying files after the app lock is released. Process crash,
+forced termination, and detached processes can leave even the direct command or
+plugin running. Before forcing a retry or removing staging, partial downloads,
+or an incomplete source checkout, inspect for and stop surviving work; preserve
+local checkout changes. An interrupted clone may leave a non-git directory that
+must be inspected and moved or removed manually before retrying. Never delete
+lock files to stop a running operation.
 
 The installer or apply operation completing is reported as `installed`; the
 version and `install_ok` event are then committed together (`recorded` in JSON).
@@ -165,6 +170,20 @@ the latter also reports post-install bookkeeping errors. `failed` describes an
 installation failure, not a rollback. To retry integration after fixing its
 cause, use `--force`, which reruns the installer as well. Warnings unrelated to
 integration do not by themselves change the exit code.
+
+There is no automatic integration-only retry. The database records the version
+and, for supported install shapes, a target path, but not the exact published
+files, plugin-provided executable hint, or integration configuration used by
+the successful installation. Reconstructing these from current configuration
+could target a different executable or installation. Inspect and repair the
+desktop entry or links manually, or explicitly rerun the installer with `--force`
+after accepting its side effects.
+
+Before using unattended bulk updates, test each actual configured apply command,
+build/install step, and installer plugin in an isolated representative environment,
+including partial failure and retry. Fixture tests cannot establish that a
+user's commands or plugins are idempotent, or that external side effects can be
+rolled back.
 
 When Updatium has no recorded install, it can infer a source-build version from
 the checkout tag if the configured install target exists. A checkout is not
@@ -212,10 +231,15 @@ for package managers, plugins, and command-driven installs. A source checkout ma
 change without changing installed files, so its tag is only an inference and
 never overrides a recorded version.
 
-Probes are run afresh on reads, once per app per check/dashboard refresh; they
-are not cached or timed out. Slow commands or commands that access the network
-will delay these operations. Source-checkout inference runs a local `git tag`
-command when needed. Choose fast, side-effect-free probes.
+Probes run afresh on reads, once per app per check/dashboard refresh; they are
+not cached. Each probe has a three-second deadline and a 64 KiB limit on each of
+stdout and stderr. Timeout, excessive output, or command failure leaves the
+installed version unknown and reports a diagnostic; the recorded version is not
+used instead. Updatium requests termination of the direct child on timeout or
+output-limit failure and waits up to one second to reap it; later cleanup is best
+effort. Descendants are not terminated and can survive; they may also keep pipes
+open until the deadline. Use fast, side-effect-free probes that manage their own
+children. Source-checkout inference runs a local `git tag` command when needed.
 
 Track-only updates (`command`, `apt`, or `flatpak` without `apply_cmd`, and
 external providers with `install.type = "none"`) observe the selected release
@@ -307,8 +331,8 @@ terminal = false
 
 **`github-releases`** — `repo` (owner/name, required), `tag_regex`,
 `asset_regex`, `include_prereleases` (default false), `api_base`
-(default `https://api.github.com`; override for GHES/tests).
-Drafts always skipped. Digests come from the asset `digest` field or a sibling
+(default `https://api.github.com`; override for GHES/tests). `tag_regex` matches
+the tag, not the display name. Drafts always skipped. Digests come from the asset `digest` field or a sibling
 `<asset>.sha256` / `SHA256SUMS` asset.
 
 **`html-links`** — `url`, `link_regex` (named group `href`),
@@ -319,10 +343,10 @@ asset. A missing sidecar is “no digest”, never an error.
 **`command`** — `check_cmd` (argv; newline-separated versions on stdout),
 optional `apply_cmd` (`{version}` substituted; omit = track-only).
 
-**`source-build`** — `repo_url`, `ref_regex` (matched against
-`git ls-remote --tags` output), optional `api_base` to also query GitHub
-releases, `[build]`: `steps`, `tracked_files`, `artifacts`, `timeout_secs`
-(default 3600), `env`.
+**`source-build`** — `repo_url`, `ref_regex` (matched against full
+`refs/tags/<tag>` names from Git and optional GitHub releases), optional
+`api_base` to also query GitHub releases, `[build]`: `steps`, `tracked_files`,
+`artifacts`, `timeout_secs` (default 3600), `env`.
 
 **`docker-registry`** — `image`
 (`docker.io/<owner>/<name>`, bare `owner/name`, or `<registry>/<host-path>`),
@@ -332,17 +356,21 @@ releases, `[build]`: `steps`, `tracked_files`, `artifacts`, `timeout_secs`
 **`apt`** — `package` (required), optional `apply_cmd` (omit = track-only;
 `{package}` and `{version}` substitutable). `check` reads the `Candidate:`
 version from `apt-cache policy <package>`; no candidate means no release.
+Installed and candidate versions use Debian/dpkg ordering, including epochs,
+revisions and `~`; configure `installed_version_cmd` to return a Debian version.
 Nothing runs as root implicitly — an unattended `apply_cmd` should start with a
 privilege-escalation prefix such as `sudo -n apt-get install --only-upgrade -y`.
 
 **`flatpak`** — `app_id` and `remote` (required), `user` (default true:
 `--user` scope; false = `--system`), `version_field`
 (`"version" | "branch" | "auto"`, default `auto`: Version column when non-empty
-else Branch), optional `branch_regex` (filter on branch; multiple matching
-branches become multiple releases and the engine picks the highest via
-`cmp_version`), optional `apply_cmd` (omit = track-only; `{app_id}`, `{remote}`,
-`{version}` substitutable). `check` lists the remote with
-`flatpak remote-ls --user|--system <remote> --app`.
+else Branch), optional `branch_regex` (filter on branch), and optional `apply_cmd`
+(omit = track-only; `{app_id}`, `{remote}`, `{version}` substitutable). Multiple
+matching branches are rejected: select one with an anchored filter such as
+`^stable$`, and ensure the apply command targets the same branch. Flatpak refs
+are not ordered against other branches. If `version_field = "branch"`, a fixed
+branch name cannot identify changes to its underlying commit. `check` lists the
+remote with `flatpak remote-ls --user|--system <remote> --app`.
 
 ## CLI
 
@@ -366,16 +394,20 @@ Status markers: `● ok ▲ update ⚠ approval ✖ error · unchecked`.
 `LATEST` is the newest version in the current provider result; versions removed
 by a config filter (such as `tag_regex` or `ref_regex`) do not linger.
 
-Version selection uses SemVer precedence for three-component SemVer versions,
-including tags prefixed with `v` or `V`; build metadata does not change
-precedence. Two-component numeric versions are compared with a zero patch;
-numeric cores with leading zeros are normalized, so date-like versions such as
-`2024.06.12` work too. The original tag is retained for fetching and applying
-releases. Other versions, including tags such as `b1234`, sort naturally
-within a separate class below all supported SemVer-like versions. Mixing these
-classes can therefore produce surprising results; use a provider filter to
-keep one version format where possible. Natural ordering is not a substitute
-for package-manager-specific version rules (including apt and Flatpak).
+Except for apt, version selection uses SemVer precedence for three-component
+SemVer versions, including tags prefixed with `v` or `V`; build metadata does not
+change precedence. Two-component numeric versions are compared with a zero
+patch; numeric cores with leading zeros are normalized. Other versions, such as
+`b1234`, use natural ordering. Mixed SemVer-like and natural-order releases, or
+an installed version from a different class, produce an error rather than an
+arbitrary update decision, even with `--force`. Constrain the source using
+`tag_regex`, `ref_regex`, `version_capture`, or `branch_regex`, and make the
+installed-version probe use the same format. These filters are source-specific;
+arbitrary command and plugin outputs must be constrained by their author. Original
+GitHub and source-build tags, including `v`/`V`, are retained for selection,
+fetching, applying and recorded state; older records without the prefix continue
+to compare equal. Natural ordering does not reproduce application-specific
+version rules.
 
 TUI keys: `/` search · `f` cycle status filters · `r` refresh · `u` update the highlighted app · `U` bulk update eligible apps · `Space` toggle a mark · `s` update marked apps · `c` clear all marks · `a` approve · `j/k/arrows/pgup/pgdn` navigate · `d` app history · `e` edit config in `$EDITOR` · `n` create app · `x` delete config only · `g/G` write/remove desktop entry · `p` plugins · `F1` help · `q` quit. Destructive actions ask for confirmation; app-config deletion retains installed files, desktop entry, and database history/state.
 

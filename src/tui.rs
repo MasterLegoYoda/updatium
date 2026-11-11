@@ -26,50 +26,58 @@ const ACTIVITY_HISTORY: usize = 4;
 pub fn run(home: Option<&Path>, print_frame: bool) -> Result<i32> {
     if print_frame {
         let engine = Engine::new(home)?;
-        println!("{}", render_db_frame(&engine));
+        let runtime = tokio::runtime::Runtime::new()?;
+        println!("{}", runtime.block_on(render_db_frame(&engine)));
         return Ok(0);
     }
     interactive(home)?;
     Ok(0)
 }
 
-fn frame_rows(engine: &Engine) -> Vec<UiRow> {
+async fn frame_rows(engine: &Engine) -> Vec<UiRow> {
     let apps = config::load_apps(&engine.home_paths().apps_d()).unwrap_or_default();
-    apps.into_iter()
-        .map(|app| {
-            let installed = engine.installed_info(&app);
-            let latest = engine.latest_known_pub(&app.id).ok().flatten();
+    let mut rows = Vec::with_capacity(apps.len());
+    for app in apps {
+            let installed = engine.installed_info(&app).await;
+            let latest_result = engine.latest_known_pub(&app.id);
+            let latest_error = latest_result.as_ref().err().map(|error| format!("{error:#}"));
+            let latest = latest_result.ok().flatten();
             let status = if !app.enabled {
                 Status::Disabled
             } else if let Ok(Some(version)) = engine.pending_update(&app.id) {
                 Status::Error(format!("update to {version} incomplete or running"))
             } else if engine.is_pending_approval(&app.id).unwrap_or(false) {
                 Status::NeedsApproval
+            } else if let Some(diagnostic) = &installed.diagnostic {
+                Status::Error(diagnostic.clone())
+            } else if let Some(error) = latest_error {
+                Status::Error(error)
             } else {
-                status_from_versions(installed.version.as_deref(), latest.as_deref())
+                status_from_versions(&app.source_kind, installed.version.as_deref(), latest.as_deref())
             };
             let (config_path, config_issue) = match app_config_path_in(engine, &app.id) {
                 Ok(path) => (Some(path), None),
                 Err(err) => (None, Some(format!("{err:#}"))),
             };
-            UiRow {
+            rows.push(UiRow {
                 app: app.id,
                 provider: app.provider,
                 enabled: app.enabled,
                 installed: installed.version,
                 installed_source: installed.source,
+                installed_diagnostic: installed.diagnostic,
                 latest,
                 status,
                 config_path,
                 config_issue,
-            }
-        })
-        .collect()
+            });
+    }
+    rows
 }
 
-fn render_db_frame(engine: &Engine) -> String {
+async fn render_db_frame(engine: &Engine) -> String {
     // Render through a ratatui Buffer so CI output equals an interactive frame.
-    let rows = frame_rows(engine);
+    let rows = frame_rows(engine).await;
     let visible: Vec<usize> = (0..rows.len()).collect();
     let backend = ratatui::backend::TestBackend::new(100, (rows.len() + 6).max(8) as u16);
     let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
@@ -89,17 +97,31 @@ fn render_db_frame(engine: &Engine) -> String {
         }
         output.push('\n');
     }
-    output.trim_end_matches('\n').to_string()
+    let mut output = output.trim_end_matches('\n').to_string();
+    for row in &ui.rows {
+        if let Some(diagnostic) = &row.installed_diagnostic {
+            output.push_str(&format!("\n{}: {diagnostic}", row.app));
+        }
+        if let Status::Error(message) = &row.status {
+            if row.installed_diagnostic.as_deref() != Some(message.as_str()) {
+                output.push_str(&format!("\n{}: {message}", row.app));
+            }
+        }
+    }
+    output
 }
 
-fn status_from_versions(installed: Option<&str>, latest: Option<&str>) -> Status {
+fn status_from_versions(kind: &config::SourceKind, installed: Option<&str>, latest: Option<&str>) -> Status {
     match (installed, latest) {
-        (Some(installed), Some(latest))
-            if crate::version::cmp_version(latest, installed) == std::cmp::Ordering::Greater =>
-        {
-            Status::UpdateAvailable
+        (Some(installed), Some(latest)) => {
+            if let Err(error) = crate::engine::ensure_same_version_class(kind, latest, installed) {
+                Status::Error(error.to_string())
+            } else if crate::engine::compare_app_versions(kind, latest, installed) == std::cmp::Ordering::Greater {
+                Status::UpdateAvailable
+            } else {
+                Status::Ok
+            }
         }
-        (Some(_), Some(_)) => Status::Ok,
         _ => Status::NeverChecked,
     }
 }
@@ -126,6 +148,7 @@ struct UiRow {
     enabled: bool,
     installed: Option<String>,
     installed_source: InstalledSource,
+    installed_diagnostic: Option<String>,
     latest: Option<String>,
     status: Status,
     config_path: Option<PathBuf>,
@@ -438,11 +461,11 @@ fn worker_refresh(
             let mut rows = Vec::with_capacity(apps.len());
             let mut row_error = None;
             for app in apps {
-                let (installed, installed_source) = match reports.get(&app.id) {
-                    Some(report) => (report.installed.clone(), report.installed_source),
+                let (installed, installed_source, installed_diagnostic) = match reports.get(&app.id) {
+                    Some(report) => (report.installed.clone(), report.installed_source, report.installed_diagnostic.clone()),
                     None => {
-                        let info = engine.installed_info(&app);
-                        (info.version, info.source)
+                        let info = runtime.block_on(engine.installed_info(&app));
+                        (info.version, info.source, info.diagnostic)
                     }
                 };
                 // Prefer the just-computed check result. The DB's latest_known
@@ -471,8 +494,10 @@ fn worker_refresh(
                     Status::Error(format!("check failed: {error}"))
                 } else if engine.is_pending_approval(&app.id).unwrap_or(false) {
                     Status::NeedsApproval
+                } else if let Some(diagnostic) = &installed_diagnostic {
+                    Status::Error(diagnostic.clone())
                 } else {
-                    status_from_versions(installed.as_deref(), latest.as_deref())
+                    status_from_versions(&app.source_kind, installed.as_deref(), latest.as_deref())
                 };
                 let (config_path, config_issue) = match app_config_path_in(engine, &app.id) {
                     Ok(path) => (Some(path), None),
@@ -484,6 +509,7 @@ fn worker_refresh(
                     enabled: app.enabled,
                     installed,
                     installed_source,
+                    installed_diagnostic,
                     latest,
                     status,
                     config_path,
@@ -1379,10 +1405,18 @@ fn render_detail(
             Style::default().add_modifier(Modifier::BOLD),
         ));
         lines.push(Line::from(format!("status: {}", row.status.label())));
+        if let Status::Error(message) = &row.status {
+            if row.installed_diagnostic.as_deref() != Some(message.as_str()) {
+                lines.push(Line::from(format!("error: {message}")));
+            }
+        }
         lines.push(Line::from(format!(
             "installed: {}",
             crate::cli::format_installed(row.installed.as_deref(), row.installed_source)
         )));
+        if let Some(diagnostic) = &row.installed_diagnostic {
+            lines.push(Line::from(format!("probe: {diagnostic}")));
+        }
         lines.push(Line::from(format!(
             "config: {}",
             row.config_path
@@ -1582,6 +1616,7 @@ mod tests {
             enabled: true,
             installed: None,
             installed_source: InstalledSource::Unknown,
+            installed_diagnostic: None,
             latest: None,
             status,
             config_path: None,

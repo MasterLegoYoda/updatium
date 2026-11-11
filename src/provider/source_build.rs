@@ -1,9 +1,9 @@
 //! provider = "source-build": git tag tracking for build-from-source repos.
 //! Versions come from `git ls-remote --tags <repo_url>` filtered by `ref_regex`;
-//! `refs/tags/` and one leading `v` are stripped. When `api_base` is set, GitHub
-//! releases are queried as well for richer metadata (union of both sources).
+//! `refs/tags/` is stripped while the tag itself is preserved. When `api_base`
+//! is set, matching GitHub releases are queried as well for richer metadata.
 
-use super::{Provider, Release, version_from_tag};
+use super::{Provider, Release};
 use crate::config::{AppSource, SourceKind};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -57,7 +57,7 @@ impl Provider for SourceBuild {
                 continue;
             }
             let tag = r.strip_prefix("refs/tags/").unwrap_or(r);
-            versions.push(version_from_tag(tag));
+            versions.push(tag.to_string());
         }
 
         let mut releases: Vec<Release> = versions
@@ -91,6 +91,7 @@ impl Provider for SourceBuild {
                     )
                     .await
                 {
+                    extra.retain(|release| re.is_match(&format!("refs/tags/{}", release.version)));
                     extra.extend(releases);
                     releases = extra;
                 }

@@ -1,6 +1,6 @@
 //! provider = "github-releases": GitHub (or GHES) release assets.
 
-use super::{Asset, Provider, Release, normalize_digest, parse_sums_line, version_from_tag};
+use super::{Asset, Provider, Release, normalize_digest, parse_sums_line};
 use crate::config::{AppSource, SourceKind};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -20,8 +20,6 @@ const MAX_PAGES: usize = 5;
 struct GhRelease {
     #[serde(default)]
     tag_name: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
     #[serde(default)]
     draft: bool,
     #[serde(default)]
@@ -153,10 +151,8 @@ impl Provider for GithubReleases {
                 if tag.is_empty() {
                     continue;
                 }
-                // Filter on the tag or the display name.
                 if let Some(re) = &tag_re {
-                    let hay_name = r.name.as_deref().unwrap_or("");
-                    if !re.is_match(&tag) && !re.is_match(hay_name) {
+                    if !re.is_match(&tag) {
                         continue;
                     }
                 }
@@ -182,7 +178,7 @@ impl Provider for GithubReleases {
                     });
                 }
                 out.push(Release {
-                    version: version_from_tag(&tag),
+                    version: tag,
                     published_at: r.published_at,
                     assets,
                 });

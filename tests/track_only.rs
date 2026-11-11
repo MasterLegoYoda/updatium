@@ -78,4 +78,7 @@ fn track_only_preserves_probe_and_outstanding_updates_for_all_providers() {
     assert!(update[0]["from"].is_null());
     assert_eq!(update[0]["track_only"], true);
     assert_eq!(update[0]["to"], "3.0.0");
+    assert!(update[0]["warnings"].to_string().contains("installed-version probe failed"));
+    let dry = cli(root, &path, &["update", "command", "--dry-run"]);
+    assert!(dry[0]["warnings"].to_string().contains("installed-version probe failed"));
 }

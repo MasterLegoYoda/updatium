@@ -81,6 +81,7 @@ pub fn parse_remote_ls(
     };
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut out = Vec::new();
+    let mut selected_branch: Option<&str> = None;
     for line in stdout.lines() {
         if line.trim().is_empty() {
             continue;
@@ -99,6 +100,15 @@ pub fn parse_remote_ls(
             if !re.is_match(branch) {
                 continue;
             }
+        }
+        if let Some(selected) = selected_branch {
+            if selected != branch {
+                bail!(
+                    "flatpak: multiple branches match for '{app_id}'; set branch_regex to an exact anchored branch pattern (for example '^stable$')"
+                );
+            }
+        } else {
+            selected_branch = Some(branch);
         }
         let resolved = match version_field {
             "version" => version,
@@ -180,6 +190,37 @@ mod tests {
     fn duplicate_rows_deduped() {
         let rows = "org.qbittorrent.qBittorrent\t5.2.3\tstable\norg.qbittorrent.qBittorrent\t5.2.3\tstable";
         assert_eq!(versions(rows, "auto", None), ["5.2.3"]);
+    }
+
+    #[test]
+    fn multiple_matching_branches_are_rejected() {
+        let rows = "org.qbittorrent.qBittorrent\t5.2.3\tstable\norg.qbittorrent.qBittorrent\t6.0b1\tbeta";
+        for field in ["auto", "version", "branch"] {
+            for regex in [None, Some("stable|beta")] {
+                let err = parse_remote_ls(rows, QBITTORRENT, field, regex).unwrap_err();
+                assert!(err.to_string().contains("branch_regex"), "{err}");
+                assert!(err.to_string().contains("^stable$"), "{err}");
+            }
+        }
+        assert_eq!(versions(rows, "auto", Some("^beta$")), ["6.0b1"]);
+    }
+
+    #[test]
+    fn blank_and_nonblank_branches_are_ambiguous() {
+        let rows = "org.qbittorrent.qBittorrent\t1.2.3\t\norg.qbittorrent.qBittorrent\t1.2.4\tstable";
+        for field in ["auto", "version", "branch"] {
+            assert!(parse_remote_ls(rows, QBITTORRENT, field, None).is_err());
+        }
+        assert_eq!(versions(rows, "auto", Some("^$")), ["1.2.3"]);
+        assert_eq!(versions(rows, "auto", Some("^stable$")), ["1.2.4"]);
+    }
+
+    #[test]
+    fn same_branch_preserves_distinct_versions_and_deduplicates_multiarch_rows() {
+        let rows = "org.qbittorrent.qBittorrent\tv1.2.3+build\tstable\norg.qbittorrent.qBittorrent\tv1.2.3+build\tstable\norg.qbittorrent.qBittorrent\tv1.2.4\tstable";
+        assert_eq!(versions(rows, "auto", None), ["v1.2.3+build", "v1.2.4"]);
+        assert_eq!(versions(rows, "version", None), ["v1.2.3+build", "v1.2.4"]);
+        assert_eq!(versions(rows, "branch", None), ["stable"]);
     }
 
     #[test]

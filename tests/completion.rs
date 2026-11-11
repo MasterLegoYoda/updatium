@@ -54,7 +54,7 @@ name = "Demo"
     assert!(report[0]["integration_failures"].to_string().contains("desktop"));
     assert!(home.path().join("state/Applications/freecad-demo-2.1.0-x86_64.AppImage").is_file());
     assert_partial(home.path(), "demo", &report);
-    assert_eq!(Engine::new(Some(home.path())).unwrap().installed_version("demo").unwrap().as_deref(), Some("2.1.0"));
+    assert_eq!(Engine::new(Some(home.path())).unwrap().installed_version("demo").await.unwrap().as_deref(), Some("v2.1.0"));
 }
 
 #[tokio::test]
@@ -93,7 +93,7 @@ link_bins = ["tool"]
     assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign");
     assert_eq!(std::fs::read(home.path().join("state/installs/demo/current/tool")).unwrap(), b"installed tool");
     assert_partial(home.path(), "demo", &report);
-    assert_eq!(Engine::new(Some(home.path())).unwrap().installed_version("demo").unwrap().as_deref(), Some("b1000"));
+    assert_eq!(Engine::new(Some(home.path())).unwrap().installed_version("demo").await.unwrap().as_deref(), Some("b1000"));
 }
 
 #[tokio::test]
@@ -137,7 +137,7 @@ type = "none"
     assert!(done.installed && done.failed.is_none(), "{done:?}");
     assert_eq!(std::fs::read_to_string(marker).unwrap(), "applied\n");
     assert!(store.pending_update("demo").unwrap().is_none());
-    assert_eq!(engine.installed_version("demo").unwrap().as_deref(), Some("2.0.0"));
+    assert_eq!(engine.installed_version("demo").await.unwrap().as_deref(), Some("2.0.0"));
 }
 
 #[tokio::test]

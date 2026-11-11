@@ -1,4 +1,6 @@
 //! source-build provider against a local git repository fixture.
+mod common;
+
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
@@ -39,6 +41,7 @@ fn make_repo() -> tempfile::TempDir {
     git(dir.path(), &["commit", "-qam", "two"]);
     git(dir.path(), &["tag", "b2000"]);
     git(dir.path(), &["tag", "v1.2.3"]);
+    git(dir.path(), &["tag", "V2.3.4"]);
     dir
 }
 
@@ -65,6 +68,46 @@ async fn lists_and_filters_tags_from_local_repo() {
         "refs/tags/ stripped, regex applied"
     );
     assert!(rels.iter().all(|r| r.assets.is_empty()));
+}
+
+#[tokio::test]
+async fn preserves_numeric_tag_prefixes() {
+    let repo = make_repo();
+    let cfg = SourceBuildCfg {
+        repo_url: repo.path().to_string_lossy().into_owned(),
+        ref_regex: r"^refs/tags/[vV]\d".into(),
+        api_base: None,
+        source_dir: None,
+        install_dir: None,
+        build: crate_build_cfg(),
+    };
+    let rels = SourceBuild.check(&app(cfg), &net::build_client().unwrap()).await.unwrap();
+    let mut versions: Vec<&str> = rels.iter().map(|r| r.version.as_str()).collect();
+    versions.sort_unstable();
+    assert_eq!(versions, vec!["V2.3.4", "v1.2.3"]);
+}
+
+#[tokio::test]
+async fn github_releases_obey_the_same_ref_filter() {
+    let repo = make_repo();
+    let (base, _guard) = common::spawn().await;
+    let cfg = SourceBuildCfg {
+        repo_url: format!("file://{}", repo.path().display()),
+        ref_regex: r"^refs/tags/b\d+$".into(),
+        api_base: Some(format!("{base}/gh")),
+        source_dir: None,
+        install_dir: None,
+        build: crate_build_cfg(),
+    };
+    let http = net::build_client().unwrap();
+    let rels = SourceBuild.check(&app(cfg.clone()), &http).await.unwrap();
+    let mut versions: Vec<&str> = rels.iter().map(|r| r.version.as_str()).collect();
+    versions.sort_unstable();
+    assert_eq!(versions, vec!["b1000", "b2000"]);
+
+    let cfg = SourceBuildCfg { ref_regex: r"^refs/tags/v2\.1\.0$".into(), ..cfg };
+    let rels = SourceBuild.check(&app(cfg), &http).await.unwrap();
+    assert_eq!(rels.iter().map(|r| r.version.as_str()).collect::<Vec<_>>(), vec!["v2.1.0"]);
 }
 
 #[tokio::test]
