@@ -19,30 +19,71 @@ counterparts. Builtin command, package-manager, Docker, and source-build flows
 still have explicit engine dispatch because their apply operations differ.
 The engine is also a reusable library.
 
-## Build & install
+## Build and install from source
 
-The repository includes a portable installer for Linux. It builds the release
-binary from the checkout and installs it into `~/.local/bin` by default:
+Prebuilt binary distribution is deferred. On Linux, the included installer
+builds the release binary from the checkout and installs it into `~/.local/bin`:
 
 ```bash
 ./install.sh
 ```
 
-Use `--prefix` or `PREFIX` to choose another installation prefix:
+Requirements: Rust 1.90 or newer, Cargo, Git for obtaining the checkout, and a C
+compiler for bundled SQLite. The script requires Linux and runs `cargo build
+--release`; it does not install or modify your application configuration or
+state. Use `--prefix` or `PREFIX` to install into a different `<prefix>/bin`:
 
 ```bash
 ./install.sh --prefix "$HOME/.local"
-PREFIX="$HOME/.local" ./install.sh
+# Equivalent: PREFIX="$HOME/.local" ./install.sh
+"$HOME/.local/bin/updatium" --version
 ```
 
-Requirements: Rust 1.90+, `git`, and a C compiler for the bundled SQLite. Linux only
-in this MVP (XDG dirs, freedesktop entries). Run `./install.sh --help` for all options.
-
-For a direct development build without installing:
+Run `./install.sh --help` for options. Contributors can build without installing:
 
 ```bash
-cargo build --release
+cargo build                 # debug binary: target/debug/updatium
+cargo build --release       # optimized binary: target/release/updatium
 ```
+
+### Upgrade an existing installation
+
+1. Choose the newer source revision deliberately and read its release notes for
+   configuration or state changes. Find the binary currently used with
+   `command -v updatium`; also check any service's `ExecStart`, which may point
+   to a different copy. Choose the same install prefix to replace that binary.
+2. Stop scheduled jobs from starting and let all Updatium commands, TUI
+   sessions, and updates finish. For the optional packaged user timer, run
+   `systemctl --user stop updatium-check.timer` and wait for any running
+   `updatium-check.service` to finish. Do not interrupt an update in progress.
+3. Back up the old binary and the configuration and state directories before
+   proceeding. With `--home` or `UPDATIUM_HOME`, back up that entire root; with
+   the default layout, back up `$XDG_CONFIG_HOME/updatium` (default
+   `~/.config/updatium`) and `$XDG_DATA_HOME/updatium` (default
+   `~/.local/share/updatium`). The state directory includes the SQLite database,
+   managed installations, source checkouts, and retained snapshots. Copy the
+   database only after all processes have stopped, including any `state.db-wal`
+   and `state.db-shm` files present. Back up application data and external
+   install locations separately; they can be outside these directories.
+4. In the checkout at the selected revision, run `./install.sh --prefix PREFIX`,
+   substituting the prefix from step 1 (omit `--prefix` for `~/.local`). This
+   rebuilds and replaces `PREFIX/bin/updatium`; it does not automatically update
+   other copies or service definitions.
+5. Run `PREFIX/bin/updatium --version`, then run `PREFIX/bin/updatium list`
+   and `PREFIX/bin/updatium history` with the same `--home` or environment as
+   before. Confirm configuration and recorded state are present. Restart any
+   scheduler stopped in step 2.
+
+The installer replaces the binary and does not intentionally reset configuration
+or state. On startup, the current version
+creates missing SQLite tables; it has no general versioned schema migration or
+guarantee that arbitrary older or newer revisions are compatible. Configuration
+parsing rejects unknown keys. Inspect release notes and validate your actual
+configuration when changing revisions. Downgrading against a database or config
+modified by a newer version is not guaranteed to work; if rollback is needed,
+stop Updatium and restore the backed-up binary **and** matching configuration
+and state. Restoring a backup also discards state changes made since that backup;
+it does not undo changes to managed applications or their data.
 
 ## Quickstart
 
