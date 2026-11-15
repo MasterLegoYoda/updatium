@@ -70,6 +70,18 @@ pub enum Cmd {
         #[arg(long, value_enum, default_value_t = ScaffoldFormat::Toml)]
         format: ScaffoldFormat,
     },
+    /// Interactively add a GitHub AppImage or maintained recipe without installing
+    Onboard {
+        /// App identifier
+        id: String,
+        /// HTTPS GitHub repository URL, or recipe:ripgrep / recipe:fd
+        repository: String,
+    },
+    /// Validate a trusted app configuration without installing it
+    Validate {
+        /// App identifier
+        id: String,
+    },
     /// List configured apps and their recorded state
     List {
         /// JSON output
@@ -486,6 +498,14 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             format,
         } => {
             cmd_add(cli, id, provider, *edit, *format)?;
+            Ok(0)
+        }
+        Cmd::Onboard { id, repository } => {
+            tokio::runtime::Runtime::new()?.block_on(crate::onboarding::github(cli.home.as_deref(), id, repository))?;
+            Ok(0)
+        }
+        Cmd::Validate { id } => {
+            tokio::runtime::Runtime::new()?.block_on(crate::onboarding::validate_config(cli.home.as_deref(), id))?;
             Ok(0)
         }
         Cmd::List { json } => {

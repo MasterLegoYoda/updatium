@@ -46,6 +46,38 @@ cargo build --release
 
 ## Quickstart
 
+### Guided GitHub onboarding
+
+```bash
+updatium onboard freecad https://github.com/FreeCAD/FreeCAD
+updatium onboard rg recipe:ripgrep
+updatium onboard fd recipe:fd
+updatium validate rg
+```
+
+The wizard previews stable releases and assets, suggests a Linux/host-architecture
+match where recognizable, and requires explicit artifact and configuration
+confirmation. The maintained `ripgrep` and `fd` recipes support Linux x86_64
+and aarch64 archives. Their filters and archive layouts are tested offline;
+upstream release changes can still require recipe maintenance. Generic GitHub
+onboarding supports AppImages and pins the exact selected filename: later
+releases with different filenames require a configuration change rather than
+silently selecting a different asset. Inspect the proposed destination before
+confirming. No artifact is downloaded or installed by onboarding.
+
+To adopt an installation, enter an executable path when prompted. The wizard runs
+it with `--version` and shows the first nonempty output line for confirmation;
+that line must itself be a version compatible with the release tags. Programs
+that print additional text or need different arguments require a manually
+configured `installed_version_cmd`. Adoption does not reinstall the application;
+a later explicit update can install into the displayed managed destination.
+
+`validate` checks trusted configurations against live discovery, asset selection,
+destination paths, and a configured version probe. Provider checks and probes
+can execute commands; build, apply, and installer commands are not executed.
+Validation does not prove an archive layout, filesystem permissions at install
+time, or the behavior of an actual build or installation.
+
 ### FreeCAD from GitHub releases
 
 ```bash
