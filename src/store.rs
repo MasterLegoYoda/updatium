@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS pending_updates(
   app_id TEXT PRIMARY KEY REFERENCES apps(id), version TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS install_targets(
   app_id TEXT PRIMARY KEY REFERENCES apps(id), path BLOB NOT NULL, is_dir INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS ownership_manifests(
+  app_id TEXT PRIMARY KEY, manifest TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events(
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
   app_id TEXT, kind TEXT NOT NULL, detail TEXT);
@@ -246,6 +248,27 @@ impl Store {
             let bytes: Vec<u8> = r.get(0)?;
             Ok((std::ffi::OsString::from_vec(bytes).into(), r.get(1)?))
         }).optional().map_err(Into::into)
+    }
+    pub(crate) fn ownership_manifest(&self, app: &str) -> Result<Option<String>> {
+        self.conn.query_row("SELECT manifest FROM ownership_manifests WHERE app_id=?1", [app], |r| r.get(0)).optional().map_err(Into::into)
+    }
+
+    pub(crate) fn set_ownership_manifest(&self, app: &str, manifest: &str) -> Result<()> {
+        self.conn.execute("INSERT INTO ownership_manifests(app_id, manifest) VALUES(?1, ?2) ON CONFLICT(app_id) DO UPDATE SET manifest=excluded.manifest", (app, manifest))?;
+        Ok(())
+    }
+    pub(crate) fn forget_ownership(&self, app: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM ownership_manifests WHERE app_id=?1", [app])?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_installed(&self, app: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE app_state SET installed_version=NULL, installed_at=NULL WHERE app_id=?1", [app])?;
+        tx.execute("DELETE FROM install_targets WHERE app_id=?1", [app])?;
+        tx.execute("DELETE FROM ownership_manifests WHERE app_id=?1", [app])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn pending_update(&self, app: &str) -> Result<Option<String>> {

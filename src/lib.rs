@@ -2,6 +2,7 @@
 //! The `updatium` binary is a thin dispatcher over this library.
 
 pub mod cli;
+pub mod cleanup;
 pub mod config;
 pub mod desktop;
 pub mod engine;

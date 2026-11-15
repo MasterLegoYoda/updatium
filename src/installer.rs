@@ -227,12 +227,37 @@ pub(crate) fn activate_directory(staged: &Path, destination: &Path) -> Result<()
     }
 }
 
+/// A staging directory with a sibling ownership marker that survives a crash.
+pub(crate) struct StagingDirectory {
+    directory: Option<tempfile::TempDir>,
+    marker: PathBuf,
+}
+
+impl StagingDirectory {
+    pub(crate) fn path(&self) -> &Path { self.directory.as_ref().expect("staging directory present").path() }
+
+    #[cfg(test)]
+    fn keep(mut self) -> PathBuf {
+        self.directory.take().expect("staging directory present").keep()
+    }
+}
+
+impl Drop for StagingDirectory {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.marker); }
+}
+
 /// Create an independently owned staging directory beside the destination.
-pub(crate) fn stage_directory(destination: &Path) -> Result<tempfile::TempDir> {
+pub(crate) fn stage_directory(destination: &Path) -> Result<StagingDirectory> {
     let parent = destination.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    tempfile::Builder::new().prefix(".updatium-staging-").tempdir_in(parent)
-        .with_context(|| format!("creating staging directory in {}", parent.display()))
+    let directory = tempfile::Builder::new().prefix(".updatium-staging-").tempdir_in(parent)
+        .with_context(|| format!("creating staging directory in {}", parent.display()))?;
+    let marker = directory.path().with_extension("owner");
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&marker)
+        .with_context(|| format!("creating staging marker {}", marker.display()))?;
+    file.write_all(b"updatium-staging-v1\n")?;
+    Ok(StagingDirectory { directory: Some(directory), marker })
 }
 
 

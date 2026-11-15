@@ -20,6 +20,18 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[path = "ownership.rs"]
+pub(crate) mod ownership;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RemovalPreview {
+    pub app_id: String,
+    pub operation: String,
+    pub removable: Vec<String>,
+    pub preserved: Vec<String>,
+    pub limitations: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Status {
     NeverChecked,
@@ -421,15 +433,11 @@ impl Engine {
     ) -> Result<UpdateReport> {
         progress(UpdateProgress::Stage("Checking for updates"));
         // Step 1: pick target version.
-        let apps = self.load_apps()?;
-        let app = apps
-            .into_iter()
-            .find(|a| a.id == id)
+        // Lock before reading configuration so untracking cannot race an update.
+        let _lock = self.lock_app(id)?;
+        let app = self.load_apps()?.into_iter().find(|a| a.id == id)
             .with_context(|| format!("unknown app '{id}'"))?;
         anyhow::ensure!(app.enabled, "app '{id}' is disabled");
-
-        // Serialize operations of one app across processes, including recovery.
-        let _lock = self.lock_app(id)?;
         // Ensure the FK target row exists even when update runs without a prior
         // check.
         self.store.sync_apps(&[(app.id.as_str(), app.provider.as_str(), app.enabled)])?;
@@ -870,7 +878,8 @@ impl Engine {
                 &serde_json::json!({
                     "asset": asset.name,
                     "url": asset.url.to_string(),
-                    "path": download_path.display().to_string()
+                    "path": download_path.display().to_string(),
+                    "sha256": ownership::sha256_file(&download_path)?
                 })
                 .to_string(),
             ),
@@ -1142,6 +1151,12 @@ impl Engine {
     fn record_install(&self, app: &AppFile, rep: &mut UpdateReport, target: Option<(&Path, bool)>) -> Result<()> {
         let version = rep.to.as_deref().context("missing installation target")?;
         rep.installed = true;
+        let supported = match &app.source_kind {
+            SourceKind::SourceBuild(sb) => sb.install_dir.is_none(),
+            SourceKind::GithubReleases(_) | SourceKind::HtmlLinks(_) => matches!(app.install.kind, InstallType::Appimage | InstallType::Archive),
+            _ => false,
+        };
+        if !supported { self.store.forget_ownership(&app.id)?; }
         let target = target.map(|(path, is_dir)| -> Result<_> {
             let path = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
             Ok((path, is_dir))
@@ -1165,8 +1180,24 @@ impl Engine {
             return;
         };
         let icon = d.icon.as_deref().map(crate::config::expand_tilde);
+        let path = self.home.desktop_dir.join(format!("updatium.{}.desktop", app.id));
+        if path.symlink_metadata().is_ok() {
+            let owned = self.desktop_is_owned(&app.id, &path).unwrap_or(false);
+            if !owned {
+                self.integration_failure(&app.id, rep, format!("desktop entry {} exists without matching ownership proof; left untouched", path.display()));
+                return;
+            }
+        }
         match desktop_entry_write(&self.home.desktop_dir, &app.id, &d.name, exec, icon.as_deref(), &d.categories, d.terminal) {
-            Ok(_) => rep.actions.push(format!("desktop entry '{}'", d.name)),
+            Ok(path) => {
+                let result = (|| -> Result<()> {
+                    let mut entries = self.ownership_entries(&app.id)?;
+                    ownership::capture(&mut entries, &path, false)?;
+                    self.save_ownership(&app.id, &entries)
+                })();
+                if let Err(error) = result { self.integration_failure(&app.id, rep, format!("recording desktop ownership: {error:#}")); }
+                rep.actions.push(format!("desktop entry '{}'", d.name));
+            }
             Err(error) => self.integration_failure(&app.id, rep, format!("desktop entry: {error:#}")),
         }
     }
@@ -1174,6 +1205,9 @@ impl Engine {
     /// Record a completed installer operation before optional integrations.
     fn finalize_installer_outcome(&self, app: &AppFile, outcome: InstallOutcome, rep: &mut UpdateReport) -> Result<()> {
         rep.actions.extend(outcome.actions);
+        // The installer has already published files; bookkeeping failures below
+        // must not report that installation never happened.
+        rep.installed = true;
         let current = self.home.install_current(&app.id);
         let exec_hint = match &outcome.publication {
             Some(pubn) => Some(current.join(pubn.published.first().map(String::as_str).unwrap_or(""))),
@@ -1186,12 +1220,31 @@ impl Engine {
         } else {
             None
         };
+        let mut owned = self.ownership_entries(&app.id)?;
+        if let Some(pubn) = &outcome.publication {
+            for rel in &pubn.published { ownership::capture(&mut owned, &current.join(rel), true)?; }
+        } else if matches!(app.install.kind, InstallType::Appimage) {
+            if let Some(path) = exec_hint.as_deref() { ownership::capture(&mut owned, path, true)?; }
+        }
+        self.save_ownership(&app.id, &owned).context("recording installation ownership")?;
         self.record_install(app, rep, target)?;
         if let Some(pubn) = outcome.publication {
             if !app.install.link_bins.is_empty() {
+                let mut allowed = Vec::new();
+                for name in &app.install.link_bins {
+                    let path = self.home.local_bin.join(name);
+                    let absolute = if path.is_absolute() { path.clone() } else { std::env::current_dir()?.join(&path) };
+                    if path.symlink_metadata().is_err() || owned.iter().any(|entry| entry.path == absolute && ownership::matches(entry).unwrap_or(false)) {
+                        allowed.push(name.clone());
+                    } else {
+                        self.integration_failure(&app.id, rep, format!("binary link {} is foreign or modified without matching ownership proof; left untouched", path.display()));
+                    }
+                }
                 match installer::link_bins(pubn, &current, &app.id,
-                    &self.home.installs(), &app.install.link_bins, &self.home.local_bin) {
+                    &self.home.installs(), &allowed, &self.home.local_bin) {
                     Ok(pubn) => {
+                        for link in &pubn.linked { ownership::capture(&mut owned, link, false)?; }
+                        self.save_ownership(&app.id, &owned).context("recording link ownership")?;
                         for link in &pubn.linked { rep.actions.push(format!("linked {}", link.display())); }
                         for conflict in pubn.conflicts { self.integration_failure(&app.id, rep, conflict); }
                     }
@@ -1479,8 +1532,158 @@ impl Engine {
     pub fn home_paths(&self) -> &HomePaths {
         &self.home
     }
+    fn ownership_entries(&self, id: &str) -> Result<Vec<ownership::Entry>> {
+        self.store.ownership_manifest(id)?.map(|s| serde_json::from_str(&s).context("invalid ownership manifest"))
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
 
-    fn lock_app(&self, id: &str) -> Result<std::fs::File> {
+    fn save_ownership(&self, id: &str, entries: &[ownership::Entry]) -> Result<()> {
+        self.store.set_ownership_manifest(id, &serde_json::to_string(entries)?)
+    }
+
+    pub(crate) fn desktop_is_owned(&self, id: &str, path: &Path) -> Result<bool> {
+        let path = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+        for entry in self.ownership_entries(id)? {
+            if entry.path == path && ownership::matches(&entry)? { return Ok(true); }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn record_desktop_ownership(&self, app: &AppFile, path: &Path) -> Result<()> {
+        self.store.sync_apps(&[(app.id.as_str(), app.provider.as_str(), app.enabled)])?;
+        let mut entries = self.ownership_entries(&app.id)?;
+        ownership::capture(&mut entries, path, false)?;
+        self.save_ownership(&app.id, &entries)
+    }
+
+    fn removal_preview(&self, id: &str, uninstall: bool) -> Result<RemovalPreview> {
+        let app = self.load_apps()?.into_iter().find(|app| app.id == id)
+            .with_context(|| format!("unknown app '{id}'"))?;
+        if let Some(version) = self.store.pending_update(id)? {
+            bail!("update to {version} is pending or interrupted; resolve it before removal");
+        }
+        let mut preview = RemovalPreview {
+            app_id: id.to_owned(), operation: if uninstall { "uninstall" } else { "untrack" }.into(),
+            removable: Vec::new(), preserved: Vec::new(),
+            limitations: vec!["History and application data are retained; external commands and package-manager effects are not reversed.".into()],
+        };
+        if !uninstall {
+            let dir = self.home.apps_d();
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.file_stem().and_then(|s| s.to_str()) == Some(id)
+                    && path.extension().and_then(|s| s.to_str()).is_some_and(|s| matches!(s, "toml" | "yaml" | "yml" | "json")) {
+                    preview.removable.push(path.display().to_string());
+                }
+            }
+            anyhow::ensure!(preview.removable.len() == 1, "expected exactly one configuration file for '{id}'");
+            preview.preserved.push("Installation, recorded state, ownership evidence, and history".into());
+        } else {
+            preview.preserved.push("Configuration, history, application data, retained snapshots and caches".into());
+            preview.limitations.push("Only individually recorded, unchanged files and links are removed; legacy, adopted, external and modified files are preserved.".into());
+            preview.limitations.push("Empty parent directories of removed managed files may also be removed; unowned directories are preserved.".into());
+            let entries = self.ownership_entries(id)?;
+            let mut paths = std::collections::BTreeMap::<PathBuf, bool>::new();
+            for entry in &entries {
+                let matches = ownership::matches(entry)?;
+                paths.entry(entry.path.clone()).and_modify(|v| *v |= matches).or_insert(matches);
+            }
+            for (path, matches) in paths {
+                if matches { preview.removable.push(path.display().to_string()); }
+                else if path.symlink_metadata().is_ok() { preview.preserved.push(format!("modified or unverified: {}", path.display())); }
+            }
+            if entries.is_empty() { preview.preserved.push("Installation has no ownership manifest; installed state is retained".into()); }
+            if let Some((root, true)) = self.store.install_target(id)? {
+                if root.symlink_metadata().is_ok_and(|m| m.file_type().is_dir()) {
+                    for item in walkdir::WalkDir::new(&root).follow_links(false).min_depth(1) {
+                        let item = item.with_context(|| format!("inspecting {}", root.display()))?;
+                        let owned = if item.file_type().is_dir() {
+                            entries.iter().any(|entry| entry.installation && entry.path.starts_with(item.path()))
+                        } else {
+                            entries.iter().any(|entry| entry.installation && entry.path == item.path())
+                        };
+                        if !owned { preview.preserved.push(format!("unowned: {}", item.path().display())); }
+                    }
+                }
+            }
+            if entries.iter().any(|entry| entry.installation) && preview.preserved.len() == 1 {
+                preview.limitations.push("Installed state is cleared only if all recorded installation files are absent and the managed directory can be removed.".into());
+            } else {
+                preview.preserved.push("Installed state is retained when installation ownership is incomplete or files remain".into());
+            }
+            let _ = app;
+        }
+        preview.removable.sort();
+        preview.preserved.sort();
+        preview.limitations.sort();
+        Ok(preview)
+    }
+
+    pub fn preview_untrack(&self, id: &str) -> Result<RemovalPreview> {
+        let _lock = self.lock_app(id)?;
+        self.removal_preview(id, false)
+    }
+
+    pub fn apply_untrack(&self, id: &str, confirmed: &RemovalPreview) -> Result<RemovalPreview> {
+        let _lock = self.lock_app(id)?;
+        let preview = self.removal_preview(id, false)?;
+        anyhow::ensure!(&preview == confirmed, "removal scope changed; preview and confirm again");
+        let path = std::fs::read_dir(self.home.apps_d())?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .find(|path| path.file_stem().and_then(|s| s.to_str()) == Some(id)
+                && path.extension().and_then(|s| s.to_str()).is_some_and(|s| matches!(s, "toml" | "yaml" | "yml" | "json")))
+            .context("configuration disappeared before untracking")?;
+        std::fs::remove_file(path)?;
+        Ok(preview)
+    }
+
+    pub fn preview_uninstall(&self, id: &str) -> Result<RemovalPreview> {
+        let _lock = self.lock_app(id)?;
+        self.removal_preview(id, true)
+    }
+
+    pub fn apply_uninstall(&self, id: &str, confirmed: &RemovalPreview) -> Result<RemovalPreview> {
+        let _lock = self.lock_app(id)?;
+        let preview = self.removal_preview(id, true)?;
+        anyhow::ensure!(&preview == confirmed, "removal scope changed; preview and confirm again");
+        let entries = self.ownership_entries(id)?;
+        let mut paths = std::collections::BTreeSet::new();
+        for entry in &entries {
+            if ownership::matches(entry)? { paths.insert(entry.path.clone()); }
+        }
+        for path in &paths { std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?; }
+        let installation: Vec<_> = entries.iter().filter(|e| e.installation).collect();
+        let mut clear = !installation.is_empty() && preview.preserved.len() == 1
+            && installation.iter().all(|e| e.path.symlink_metadata().is_err());
+        if let Some((root, true)) = self.store.install_target(id)? {
+            let current = self.home.install_current(id);
+            let current = if current.is_absolute() { current } else { std::env::current_dir()?.join(current) };
+            if root == current {
+                let mut parents = std::collections::BTreeSet::new();
+                for entry in &installation {
+                    let mut parent = entry.path.parent();
+                    while let Some(path) = parent {
+                        if !path.starts_with(&root) { break; }
+                        parents.insert(path.to_path_buf());
+                        if path == root { break; }
+                        parent = path.parent();
+                    }
+                }
+                let mut parents: Vec<_> = parents.into_iter().collect();
+                parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+                for path in parents { let _ = std::fs::remove_dir(path); }
+                clear &= root.symlink_metadata().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+            } else {
+                clear = false;
+            }
+        }
+        if clear { self.store.clear_installed(id)?; }
+        Ok(preview)
+    }
+
+    pub(crate) fn lock_app(&self, id: &str) -> Result<std::fs::File> {
         let locks = self.home.state_dir.join("update-locks");
         std::fs::create_dir_all(&locks)?;
         let lock = std::fs::OpenOptions::new().create(true).write(true).open(locks.join(app_key(id)))?;
@@ -1491,12 +1694,12 @@ impl Engine {
     /// Recompute the tracked-files bundle and clear the approval gate.
     /// Returns (old_hash, new_hash).
     pub fn approve(&self, id: &str) -> Result<(Option<String>, String)> {
+        let _lock = self.lock_app(id)?;
         let app = self
             .load_apps()?
             .into_iter()
             .find(|a| a.id == id)
             .with_context(|| format!("unknown app '{id}'"))?;
-        let _lock = self.lock_app(id)?;
         let sb = match &app.source_kind {
             SourceKind::SourceBuild(sb) => sb.clone(),
             _ => bail!("approval gate applies only to source-build apps"),

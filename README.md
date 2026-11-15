@@ -498,6 +498,54 @@ inspect the application and its history, and use the application's or package
 manager's own recovery procedure and backups. If an interrupted operation or
 bookkeeping failure is reported, inspect the files and history before retrying.
 
+## Untracking, uninstalling, and cleanup
+
+These commands preview by default. Review the output, then repeat with `--yes`
+to apply. JSON output includes the preview and, when applied, the actual result.
+The scope is checked again under the app lock before removal; if it changes
+within an invocation, the command refuses and must be reviewed again.
+
+```bash
+updatium untrack myapp                  # preview removing only its configuration
+updatium untrack myapp --yes            # retain installation and state
+updatium uninstall myapp                # preview owned files and integration
+updatium uninstall myapp --yes          # keep configuration and history
+updatium cleanup myapp --downloads --staging
+updatium cleanup myapp --retained --yes # explicitly delete rollback snapshots
+```
+
+`untrack` removes the app's `apps.d` configuration, but leaves its installation,
+links, desktop entry, state, ownership records, caches, and history untouched.
+To use `uninstall` afterward, first restore a valid configuration with the same
+ID. For a managed removal before untracking, run `uninstall` first.
+
+`uninstall` removes individually recorded files, binary links, and desktop entries
+only while their current fingerprints still match what Updatium recorded. It
+preserves unknown or modified files and adopted installations, including older
+installations without an ownership manifest. A configured destination or an
+old installed-version record by itself does not establish ownership. It may
+remove empty parent directories of removed files, but retains unrelated
+directories. Installed state is cleared only when all recorded installation
+files are gone and the managed tree can be removed; otherwise it is preserved.
+An authoritative `installed_version_cmd` may still observe an external install.
+Application data, external install directories, plugins, package managers,
+build/apply side effects, retained snapshots, caches, configuration, and
+history are not removed. Desktop entries created manually through Updatium are
+also recorded; existing unverified or modified entries are not overwritten or
+removed by its desktop command.
+
+`cleanup` requires at least one category. `--downloads` selects completed
+downloads whose recorded SHA-256 still matches; legacy, changed, partial, and
+unrecorded downloads are left alone. `--staging` selects marked stale staging
+directories under the managed app and retained-snapshot directories; unmarked
+legacy and external-directory staging are left alone. `--retained` selects
+recognized snapshots and permanently removes those rollback points. None of
+these categories removes the current installation, configuration, history, or
+application data. Cleanup holds the app lock and, for downloads, the download
+directory lock; active or interrupted/pending updates block it. Resolve recovery
+first. Other processes that do not use Updatium's locks can still race filesystem
+checks, so do not modify these paths while removing or cleaning them.
+
 ## CLI
 
 ```
@@ -506,6 +554,9 @@ updatium list [--json]
 updatium check [ids...|--all] [--json]     # default: all enabled
 updatium update (<id>|--all) [--yes] [--dry-run] [--force]
 updatium unpin <id>
+updatium untrack <id> [--yes]
+updatium uninstall <id> [--yes]
+updatium cleanup <id> [--downloads] [--staging] [--retained] [--yes]
 updatium rollback <id> (--list | [--version <version>] --yes)
 updatium approve <id> [--show-diff] [--yes]
 updatium history [<id>] [--limit 50] [--json]

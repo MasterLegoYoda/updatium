@@ -116,7 +116,7 @@ pub fn record(home: &HomePaths, id: &str, version: &str) -> Result<()> {
     }
     // Validate existing entries before modifying anything.
     let _ = snapshots(&root)?;
-    let staged = tempfile::Builder::new().prefix(".staging-").tempdir_in(&root)?;
+    let staged = crate::installer::stage_directory(&root.join("snapshot"))?;
     let tree = staged.path().join("tree");
     std::fs::create_dir(&tree)?;
     copy_tree(&current, &tree)?;
@@ -124,7 +124,7 @@ pub fn record(home: &HomePaths, id: &str, version: &str) -> Result<()> {
     let manifest = Manifest { format: 1, version: version.to_owned(), created_nanos: SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() };
     std::fs::write(staged.path().join("manifest.json"), serde_json::to_vec(&manifest)?)?;
     let name = staged.path().file_name().expect("temporary directory has a name").to_string_lossy();
-    let destination = root.join(format!("{PREFIX}{}", name.trim_start_matches(".staging-")));
+    let destination = root.join(format!("{PREFIX}{}", name.trim_start_matches(".updatium-staging-")));
     rustix::fs::renameat_with(rustix::fs::CWD, staged.path(), rustix::fs::CWD, &destination, rustix::fs::RenameFlags::NOREPLACE)
         .context("publishing retained snapshot")?;
     for snapshot in snapshots(&root)?.into_iter().skip(KEEP) {

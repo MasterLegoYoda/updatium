@@ -116,6 +116,36 @@ pub enum Cmd {
         /// App identifier
         id: String,
     },
+    /// Stop tracking an app; retain its installation, integration, and history
+    Untrack {
+        id: String,
+        /// Apply the removal of configuration after reviewing the preview
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Remove proven Updatium-owned installation files and integration
+    Uninstall {
+        id: String,
+        /// Apply the ownership-aware removal after reviewing the preview
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Inspect or clean selected per-app cached and retained artifacts
+    Cleanup {
+        id: String,
+        /// Include obsolete downloads (may require re-downloading)
+        #[arg(long)]
+        downloads: bool,
+        /// Include safely identifiable stale staging directories
+        #[arg(long)]
+        staging: bool,
+        /// Include retained rollback snapshots (destroys rollback points)
+        #[arg(long)]
+        retained: bool,
+        /// Delete the selected artifacts after reviewing the preview
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// List or restore retained managed installation files
     Rollback {
         id: String,
@@ -624,14 +654,21 @@ pub(crate) fn edit_config(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn manage_desktop(e: &Engine, id: &str, remove: bool) -> Result<()> {
-    if remove {
-        crate::desktop::remove_desktop(&e.home_paths().desktop_dir, id)?;
-        return Ok(());
-    }
+    let _lock = e.lock_app(id)?;
     let app: AppFile = crate::config::load_apps(&e.home_paths().apps_d())?
         .into_iter()
         .find(|a| a.id == id)
         .with_context(|| format!("unknown app '{id}'"))?;
+    let path = e.home_paths().desktop_dir.join(format!("updatium.{id}.desktop"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => anyhow::ensure!(e.desktop_is_owned(id, &path)?, "desktop entry {} is foreign or modified; left untouched", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error.into()),
+    }
+    if remove {
+        crate::desktop::remove_desktop(&e.home_paths().desktop_dir, id)?;
+        return Ok(());
+    }
     let d = app
         .install
         .desktop
@@ -640,7 +677,7 @@ pub(crate) fn manage_desktop(e: &Engine, id: &str, remove: bool) -> Result<()> {
     let current = e.home_paths().install_current(id);
     let exec_hint =
         first_executable_under(&current, &app.install.link_bins).unwrap_or(current);
-    crate::desktop::write_desktop(
+    let written = crate::desktop::write_desktop(
         &e.home_paths().desktop_dir,
         id,
         &d.name,
@@ -652,9 +689,18 @@ pub(crate) fn manage_desktop(e: &Engine, id: &str, remove: bool) -> Result<()> {
         &d.categories,
         d.terminal,
     )?;
+    e.record_desktop_ownership(&app, &written)?;
     Ok(())
 }
 
+
+fn print_removal_preview(preview: &crate::engine::RemovalPreview, title: &str) {
+    println!("{title}: {} ({})", preview.app_id, preview.operation);
+    if preview.removable.is_empty() { println!("  no removable items"); }
+    for item in &preview.removable { println!("  remove: {item}"); }
+    for item in &preview.preserved { println!("  preserve: {item}"); }
+    for item in &preview.limitations { println!("  note: {item}"); }
+}
 
 fn summarize_exit(failures: usize, pending: usize) -> Result<i32> {
     Ok(if failures > 0 || pending > 0 { 2 } else { 0 })
@@ -693,6 +739,45 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 println!("released version pin for '{id}'");
             } else {
                 println!("no version pin configured for '{id}'");
+            }
+            Ok(0)
+        }
+        Cmd::Untrack { id, yes } | Cmd::Uninstall { id, yes } => {
+            let engine = Engine::new(cli.home.as_deref())?;
+            let untrack = matches!(&cli.command, Cmd::Untrack { .. });
+            let preview = if untrack { engine.preview_untrack(id)? } else { engine.preview_uninstall(id)? };
+            if !cli.json {
+                print_removal_preview(&preview, "Preview");
+                if !yes { println!("No changes made. Pass --yes to apply; the scope is rechecked."); }
+            }
+            let applied = if *yes {
+                Some(if untrack { engine.apply_untrack(id, &preview)? } else { engine.apply_uninstall(id, &preview)? })
+            } else { None };
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({"preview": preview, "applied": applied}))?);
+            } else if let Some(result) = &applied {
+                print_removal_preview(result, "Applied");
+            }
+            Ok(0)
+        }
+        Cmd::Cleanup { id, downloads, staging, retained, yes } => {
+            anyhow::ensure!(*downloads || *staging || *retained, "select at least one of --downloads, --staging, or --retained");
+            let home = crate::config::HomePaths::resolve(cli.home.as_deref())?;
+            let options = crate::cleanup::CleanupOptions { downloads: *downloads, staging: *staging, snapshots: *retained };
+            let preview = crate::cleanup::preview(&home, id, &options)?;
+            if !cli.json {
+                println!("Cleanup preview for {id} (current installation, configuration, history, and application data are preserved):");
+                for item in &preview { println!("  {:?}: {}", item.category, item.path.display()); }
+                if preview.is_empty() { println!("  no eligible artifacts"); }
+                if *retained { println!("  retained snapshots selected for deletion will no longer be available for rollback"); }
+                if !yes { println!("No changes made. Pass --yes to apply; candidates are rechecked."); }
+            }
+            let applied = if *yes { Some(crate::cleanup::apply(&home, id, &options, &preview)?) } else { None };
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({"app": id, "preview": preview, "applied": applied, "retained_selected": retained}))?);
+            } else if let Some(items) = &applied {
+                println!("Removed {} cleanup artifacts:", items.len());
+                for item in items { println!("  {:?}: {}", item.category, item.path.display()); }
             }
             Ok(0)
         }
