@@ -93,6 +93,7 @@ impl Provider for HtmlLinks {
             out.push(Release {
                 version,
                 published_at: None,
+                release_url: None,
                 assets: vec![Asset {
                     name,
                     url: asset_url,

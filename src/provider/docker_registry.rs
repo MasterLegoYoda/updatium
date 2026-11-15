@@ -196,6 +196,7 @@ impl Provider for DockerRegistry {
             .map(|version| Release {
                 version,
                 published_at: None,
+                release_url: None,
                 assets: vec![],
             })
             .collect())

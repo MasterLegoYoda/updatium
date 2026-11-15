@@ -15,6 +15,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "approved",
     "install_started",
     "install_ok",
+    "rollback_ok",
     "integration_failed",
     "install_failed",
     "applied",

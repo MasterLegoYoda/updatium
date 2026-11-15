@@ -42,6 +42,7 @@ impl Provider for Apt {
         Ok(vec![Release {
             version,
             published_at: None,
+            release_url: None,
             assets: vec![],
         }])
     }

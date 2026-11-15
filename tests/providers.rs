@@ -46,6 +46,49 @@ async fn gh_check(base: &str, include_prereleases: bool) -> anyhow::Result<Vec<R
 }
 
 #[tokio::test]
+async fn github_release_url_accepts_only_http_and_https() {
+    use axum::{extract::RawQuery, routing::get, Router};
+
+    let router = Router::new().route(
+        "/gh/repos/demo/app/releases",
+        get(|RawQuery(query): RawQuery| async move {
+            if query.as_deref().is_some_and(|q| q.split('&').any(|part| part == "page=1")) {
+                r#"[
+                    {"tag_name":"https", "html_url":"https://github.com/demo/app/releases/tag/v1"},
+                    {"tag_name":"http", "html_url":"http://example.com/changelog"},
+                    {"tag_name":"missing"},
+                    {"tag_name":"invalid", "html_url":"not a url"},
+                    {"tag_name":"scheme", "html_url":"javascript:alert(1)"},
+                    {"tag_name":"wrong-type", "html_url":42}
+                ]"#
+            } else {
+                "[]"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let releases = gh_check(&base, false).await.unwrap();
+    assert_eq!(releases.len(), 6);
+    let url = |version: &str| releases.iter().find(|r| r.version == version).unwrap().release_url.as_ref().map(|u| u.as_str());
+    assert_eq!(url("https"), Some("https://github.com/demo/app/releases/tag/v1"));
+    assert_eq!(url("http"), Some("http://example.com/changelog"));
+    for version in ["missing", "invalid", "scheme", "wrong-type"] {
+        assert_eq!(url(version), None, "{version}");
+    }
+    server.abort();
+}
+
+#[test]
+fn plugin_release_without_url_remains_compatible() {
+    let release: Release = serde_json::from_str(r#"{"version":"1.0"}"#).unwrap();
+    assert!(release.release_url.is_none());
+    assert!(serde_json::to_value(release).unwrap().get("release_url").is_none());
+}
+
+#[tokio::test]
 async fn github_pagination_filters_and_digests() {
     let (base, _guard) = common::spawn().await;
 

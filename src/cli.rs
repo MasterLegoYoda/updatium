@@ -116,6 +116,19 @@ pub enum Cmd {
         /// App identifier
         id: String,
     },
+    /// List or restore retained managed installation files
+    Rollback {
+        id: String,
+        /// Retained version to restore (default: newest retained)
+        #[arg(long, conflicts_with = "list")]
+        version: Option<String>,
+        /// List retained versions without restoring
+        #[arg(long)]
+        list: bool,
+        /// Confirm replacement of the current managed tree
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Clear a source-build script-change gate after review
     Approve {
         id: String,
@@ -683,6 +696,24 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Rollback { id, version, list, yes } => {
+            let engine = Engine::new(cli.home.as_deref())?;
+            if *list {
+                let versions = engine.rollback_versions(id)?;
+                if cli.json { println!("{}", serde_json::json!({"app": id, "retained_versions": versions})); }
+                else if versions.is_empty() { println!("no retained versions for '{id}'"); }
+                else { for version in versions { println!("{version}"); } }
+            } else {
+                anyhow::ensure!(*yes, "rollback replaces the current managed tree; inspect retained versions with rollback {id} --list, then pass --yes. External effects and application data are not restored");
+                let restored = engine.rollback(id, version.as_deref())?;
+                if cli.json { println!("{}", serde_json::json!({"app": id, "restored_version": restored, "external_state_restored": false})); }
+                else {
+                    println!("restored managed installation {id} to {restored}");
+                    println!("External commands, application data, binary links and desktop integration were not rolled back; inspect them before use.");
+                }
+            }
+            Ok(0)
+        }
         Cmd::List { json } => {
             let e = Engine::new(cli.home.as_deref())?;
             let rows = tokio::runtime::Runtime::new()?.block_on(e.store_list())?;
@@ -747,6 +778,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                                 "installed": r.installed, "installed_source": r.installed_source,
                                 "installed_diagnostic": r.installed_diagnostic,
                                 "latest": r.latest,
+                                "release_url": r.release_url,
                                 "status": match &r.status {
                                     Status::NeverChecked => "never_checked",
                                     Status::Ok => "ok",
@@ -764,6 +796,9 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                     println!("{}", serde_json::to_string_pretty(&payload)?);
                 } else {
                     print!("{}", render_table(&report_rows(&reports)));
+                    for report in &reports {
+                        if let Some(url) = &report.release_url { println!("{} release notes: {url}", report.app); }
+                    }
                 }
 
                 e.notify(&reports, &failures)?;
@@ -810,6 +845,10 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                         update_reports.push(rep);
                     } else {
                         println!("== {}", rep.app);
+                        if rep.from.is_some() || rep.to.is_some() {
+                            println!("   version: {} -> {}", rep.from.as_deref().unwrap_or("unknown"), rep.to.as_deref().unwrap_or("unknown"));
+                        }
+                        if let Some(url) = &rep.release_url { println!("   release notes: {url}"); }
                         for a in &rep.actions {
                             println!("   {a}");
                         }
@@ -837,6 +876,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                                     "track_only": r.track_only,
                                     "installed": r.installed,
                                     "recorded": r.recorded,
+                                    "verified": r.verified, "release_url": r.release_url,
                                     "integration_failures": r.integration_failures,
                                     "actions": r.actions, "warnings": r.warnings,
                                     "failed": r.failed,

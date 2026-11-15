@@ -72,6 +72,8 @@ pub struct CheckReport {
     pub installed_source: InstalledSource,
     pub installed_diagnostic: Option<String>,
     pub latest: Option<String>,
+    /// Upstream release page for the latest advertised release, when supplied.
+    pub release_url: Option<url::Url>,
     pub status: Status,
 }
 
@@ -102,6 +104,9 @@ pub struct UpdateReport {
     pub installed: bool,
     /// Whether the installed version and success event were committed.
     pub recorded: bool,
+    /// None means no post-install check ran; Some(false) means it failed.
+    pub verified: Option<bool>,
+    pub release_url: Option<url::Url>,
     /// Post-install integration or bookkeeping failures; files were not rolled back.
     pub integration_failures: Vec<String>,
     pub actions: Vec<String>,
@@ -260,6 +265,7 @@ impl Engine {
                         installed_source: info.source,
                         installed_diagnostic: info.diagnostic,
                         latest: None,
+                        release_url: None,
                         status: Status::Error(msg),
                     });
                 }
@@ -324,6 +330,7 @@ impl Engine {
                         installed,
                         installed_source: info.source,
                         installed_diagnostic: info.diagnostic,
+                        release_url: releases.first().and_then(|release| release.release_url.clone()),
                         latest,
                         status,
                     });
@@ -507,13 +514,9 @@ impl Engine {
                         app: id.to_string(),
                         from: from.clone(),
                         to: from.clone(),
-                        track_only: false,
-                        installed: false,
-                        recorded: false,
-                        integration_failures: vec![],
                         actions: vec![blocked.unwrap_or_else(|| "nothing to do".into())],
                         warnings: probe_warnings,
-                        failed: None,
+                        ..Default::default()
                     });
                 }
             }
@@ -537,13 +540,9 @@ impl Engine {
             app: id.to_string(),
             from,
             to: Some(target.version.clone()),
-            track_only: false,
-            installed: false,
-            recorded: false,
-            integration_failures: vec![],
-            actions: vec![],
+            release_url: target.release_url.clone(),
             warnings: probe_warnings,
-            failed: None,
+            ..Default::default()
         };
 
         if pending.is_some() && track_only && !o.dry_run {
@@ -569,6 +568,18 @@ impl Engine {
             self.describe_plan(&app, &target, &mut rep.actions);
             return Ok(rep);
         }
+        // Only previously recorded managed trees qualify; an adopted path or a
+        // stale/interrupted update is not evidence of a restorable installation.
+        if pending.is_none() && self.managed_tree(&app)? {
+            if let Some(version) = self.store.state(id)?.and_then(|state| state.installed_version) {
+                if let Err(error) = crate::retention::record(&self.home, id, &version) {
+                    rep.failed = Some(format!("could not retain the current managed installation: {error:#}; no update was applied"));
+                    return Ok(rep);
+                }
+                rep.actions.push(format!("retained managed installation {version} (up to two snapshots)"));
+            }
+        }
+
 
         self.store.begin_update(id, &target.version)?;
         self.store.event(
@@ -592,6 +603,21 @@ impl Engine {
                 let _ = self.store.event("install_failed", Some(id), Some(&msg));
             }
         }
+        if rep.installed {
+            if let Some(cmd) = &app.post_install_check_cmd {
+                progress(UpdateProgress::Stage("Checking application health"));
+                match crate::health::run(cmd).await {
+                    Ok(()) => {
+                        rep.verified = Some(true);
+                        rep.actions.push("post-install health check passed".into());
+                    }
+                    Err(error) => {
+                        rep.verified = Some(false);
+                        self.integration_failure(id, &mut rep, format!("post-install health check failed: {error:#}"));
+                    }
+                }
+            }
+        }
         if (pending.is_none() || rep.failed.is_none()) && (!effects_started || rep.failed.is_none()) && (!rep.installed || rep.recorded) {
             if let Err(error) = self.store.finish_update(id) {
                 let detail = format!("could not finalize update bookkeeping: {error:#}; inspect the installation and retry with --force");
@@ -607,6 +633,50 @@ impl Engine {
         Ok(rep)
     }
 
+    /// The target must have been recorded by a supported builtin installer.
+    fn managed_tree(&self, app: &AppFile) -> Result<bool> {
+        let supported = match &app.source_kind {
+            SourceKind::GithubReleases(_) | SourceKind::HtmlLinks(_) => matches!(app.install.kind, InstallType::Archive),
+            SourceKind::SourceBuild(sb) => sb.install_dir.is_none(),
+            _ => false,
+        };
+        if !supported { return Ok(false); }
+        let current = self.home.install_current(&app.id);
+        let current = if current.is_absolute() { current } else { std::env::current_dir()?.join(current) };
+        Ok(self.store.install_target(&app.id)?.is_some_and(|(path, is_dir)| is_dir && path == current))
+    }
+
+    /// List snapshots only for a currently recorded managed installation.
+    pub fn rollback_versions(&self, id: &str) -> Result<Vec<String>> {
+        let _lock = self.lock_app(id)?;
+        let app = self.load_apps()?.into_iter().find(|app| app.id == id)
+            .with_context(|| format!("unknown app '{id}'"))?;
+        anyhow::ensure!(self.managed_tree(&app)?, "rollback is unavailable: no recorded managed archive or directory installation; inspect external state and restore from its own backup");
+        crate::retention::list(&self.home, id)
+    }
+
+    /// Restore a retained managed tree; external effects and data are untouched.
+    pub fn rollback(&self, id: &str, requested: Option<&str>) -> Result<String> {
+        let _lock = self.lock_app(id)?;
+        let app = self.load_apps()?.into_iter().find(|app| app.id == id)
+            .with_context(|| format!("unknown app '{id}'"))?;
+        anyhow::ensure!(self.managed_tree(&app)?, "rollback is unavailable: no recorded managed archive or directory installation; inspect external state and restore from its own backup");
+        let versions = crate::retention::list(&self.home, id)?;
+        let version = requested.or_else(|| versions.first().map(String::as_str))
+            .context("no retained versions available")?;
+        anyhow::ensure!(versions.iter().any(|entry| entry == version), "no retained version {version:?}");
+        self.store.begin_update(id, version)?;
+        crate::retention::rollback(&self.home, id, version)
+            .context("rollback failed; inspect installation and history before retrying")?;
+        let current = self.home.install_current(id);
+        let current = if current.is_absolute() { current } else { std::env::current_dir()?.join(current) };
+        self.store.record_install(id, version, Some((&current, true)))
+            .context("rollback restored files but recording failed; installation state remains uncertain")?;
+        self.store.event("rollback_ok", Some(id), Some(&serde_json::json!({"version": version}).to_string()))?;
+        self.store.finish_update(id).context("rollback restored files but finalizing state failed")?;
+        Ok(version.to_owned())
+    }
+
     async fn check_one_versions(&self, app: &AppFile) -> Result<Vec<Release>> {
         let p = provider::lookup_btree(&self.registry, &app.provider)?;
         p.check(&self.app_source(app), &self.app_http(app)?).await
@@ -616,9 +686,19 @@ impl Engine {
         match &app.source_kind {
             SourceKind::GithubReleases(_) | SourceKind::HtmlLinks(_) => {}
             SourceKind::SourceBuild(sb) => {
-                actions.push(format!("clone/fetch {}", sb.repo_url));
+                let checkout = sb.source_dir.as_deref().map(crate::config::expand_tilde)
+                    .unwrap_or_else(|| self.home.src().join(&app.id));
+                actions.push(format!("clone/fetch {} into {}", sb.repo_url, checkout.display()));
                 actions.push(format!("checkout --detach {}", target.version));
-                actions.push(format!("run {} build steps", sb.build.steps.len()));
+                for step in &sb.build.steps { actions.push(format!("build command: {}", step.join(" "))); }
+                for step in &sb.build.install_steps { actions.push(format!("install command ({{install_dir}} is a staging path): {}", step.join(" "))); }
+                if let Some(dir) = &sb.install_dir {
+                    actions.push(format!("replace installation directory {}", crate::config::expand_tilde(dir).display()));
+                    actions.push("automatic rollback is unavailable for external install directories; restore from your own backup".into());
+                } else {
+                    actions.push(format!("publish selected artifacts to {}", self.home.install_current(&app.id).display()));
+                }
+                actions.push("build commands may change additional files or application data; rollback does not undo those changes".into());
             }
             SourceKind::Command(c) => {
                 if let Some(apply) = &c.apply_cmd {
@@ -643,25 +723,30 @@ impl Engine {
             }
             SourceKind::External { .. } => {}
         }
-        match &app.install.kind {
-            InstallType::Appimage => actions.push(format!(
-                "install AppImage to {}",
-                app.install
-                    .target
-                    .as_deref()
-                    .map(crate::config::expand_tilde)
-                    .unwrap_or_else(|| self.home.default_appimage_target())
-                    .display()
-            )),
-            InstallType::Archive => actions.push("extract + publish bin_glob".into()),
-            InstallType::Dir => actions.push("publish artifacts".into()),
-            InstallType::None => {}
-            InstallType::External(n) => {
-                actions.push(format!("install via external installer '{n}'"));
+        if !matches!(app.source_kind, SourceKind::SourceBuild(_)) {
+            match &app.install.kind {
+                InstallType::Appimage => {
+                    let target_dir = app.install.target.as_deref().map(crate::config::expand_tilde)
+                        .unwrap_or_else(|| self.home.default_appimage_target());
+                    actions.push(format!("install AppImage in {}", target_dir.display()));
+                    actions.push("automatic rollback is unavailable for AppImages; preserve a backup of the previous executable before updating".into());
+                }
+                InstallType::Archive | InstallType::Dir => actions.push(format!("publish selected artifacts to {}", self.home.install_current(&app.id).display())),
+                InstallType::None => {},
+                InstallType::External(n) => actions.push(format!("install via external installer '{n}'")),
             }
         }
+        if !app.install.link_bins.is_empty() {
+            actions.push(format!("link binaries [{}] in {}", app.install.link_bins.join(", "), self.home.local_bin.display()));
+        }
+        if let Some(cmd) = &app.post_install_check_cmd {
+            actions.push(format!("post-install health command (three-second timeout): {cmd:?}"));
+        }
+        if matches!(app.source_kind, SourceKind::Command(_) | SourceKind::Apt(_) | SourceKind::Flatpak(_) | SourceKind::DockerRegistry(_) | SourceKind::External { .. }) || matches!(app.install.kind, InstallType::External(_)) {
+            actions.push("external operations may change additional state; Updatium cannot roll them back. Inspect the application, package manager or plugin and restore from its own backup if needed".into());
+        }
         if let Some(d) = &app.install.desktop {
-            actions.push(format!("write desktop entry '{}'", d.name));
+            actions.push(format!("write desktop entry '{}' at {}", d.name, self.home.desktop_dir.join(format!("updatium.{}.desktop", app.id)).display()));
         }
     }
 

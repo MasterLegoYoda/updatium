@@ -441,6 +441,63 @@ commands or external installers, so Updatium refuses to apply with pin, range,
 or skip configured for those mechanisms. Hold and manual policies remain usable.
 Track-only configurations perform no installation.
 
+## Update plans, verification, and recovery
+
+Run `updatium update <id> --dry-run` to review the selected source and target
+versions, download, paths, configured commands, and limitations without running
+the installer or apply/build commands. Provider checks and installed-version
+probes still run, and Updatium may create its normal database and lock files.
+GitHub release pages are shown by `check` and update reports when supplied by
+the provider; JSON output exposes `release_url`. A page is an upstream link,
+not an endorsement or a guarantee that its contents describe the artifact.
+Plans print configured commands and URLs, which may contain sensitive data.
+
+To run an optional health check after an installation or apply command completes:
+
+```toml
+post_install_check_cmd = ["/path/to/my-app", "--self-test"]
+```
+
+This is an argv array, not a shell expression unless you explicitly invoke a
+shell. Exit status zero means the check passed; it does not automatically compare
+versions or prove the application works. It runs only after a completed install,
+not during a dry run, a track-only operation, or rollback. It has the same
+three-second deadline, output limits, and direct-child-only termination caveat
+as installed-version probes. Configure trusted, fast, side-effect-free commands.
+JSON update reports distinguish `installed` and `recorded` from `verified`:
+`verified` is `true` or `false` when the check ran, and `null` otherwise. A
+failed check is reported as a post-install failure with exit code 2; the
+installation and recorded version remain in place. The check's output and
+arguments are not included in failure diagnostics.
+
+For a recorded managed archive installation or a source build published into
+Updatium's managed `current` directory, Updatium copies the prior tree before
+replacement and retains the two newest snapshots under that app's `retained`
+directory. An attempt can create a snapshot even if the later update fails;
+repeated attempts can evict older snapshots. An initial installation has no
+previous snapshot. Retention refuses symlinks or special files in the tree and
+aborts the update if a known managed installation cannot be safely retained.
+Snapshot storage consumes disk space and is not a substitute for backups.
+
+```bash
+updatium rollback <id> --list
+updatium rollback <id> --version <retained-version> --yes
+# Omit --version to restore the newest retained version.
+```
+
+Rollback atomically replaces the current managed tree with a copy of the chosen
+snapshot and records its version; it does not remove the retained snapshot.
+Inspect the current tree first: changes made inside it since installation will
+be replaced. Existing binary links and desktop entries are not recreated and
+may need repair. An installed-version probe remains authoritative and may report
+a different version after rollback. Application data, migrations, build command
+effects, package-manager operations, containers, plugins, and external state are
+not rolled back. Automatic rollback is unavailable for AppImages, external
+source install directories, adopted installations, and arbitrary apply commands;
+inspect the application and its history, and use the application's or package
+manager's own recovery procedure and backups. If an interrupted operation or
+bookkeeping failure is reported, inspect the files and history before retrying.
+
 ## CLI
 
 ```
@@ -449,6 +506,7 @@ updatium list [--json]
 updatium check [ids...|--all] [--json]     # default: all enabled
 updatium update (<id>|--all) [--yes] [--dry-run] [--force]
 updatium unpin <id>
+updatium rollback <id> (--list | [--version <version>] --yes)
 updatium approve <id> [--show-diff] [--yes]
 updatium history [<id>] [--limit 50] [--json]
 updatium plugins [--json]

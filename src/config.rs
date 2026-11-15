@@ -645,6 +645,8 @@ pub struct AppFile {
     /// Optional authoritative version probe, consulted even after an update.
     /// A failed or empty probe means the installed version is unknown.
     pub installed_version_cmd: Option<Vec<String>>,
+    /// Optional direct argv health check run after installation.
+    pub post_install_check_cmd: Option<Vec<String>>,
     pub install: InstallCfg,
     pub source_kind: SourceKind,
 }
@@ -697,6 +699,13 @@ impl AppFile {
         let proxy = opt_field::<String>(&mut table, "proxy", path_for_errors)?;
         let installed_version_cmd =
             opt_field::<Vec<String>>(&mut table, "installed_version_cmd", path_for_errors)?;
+        let post_install_check_cmd =
+            opt_field::<Vec<String>>(&mut table, "post_install_check_cmd", path_for_errors)?;
+        if post_install_check_cmd.as_ref().is_some_and(|cmd| {
+            cmd.first().is_none_or(|executable| executable.trim().is_empty())
+        }) {
+            bail!("{path_for_errors}: post_install_check_cmd must contain a nonempty executable");
+        }
         let install =
             opt_field::<InstallCfg>(&mut table, "install", path_for_errors)?.unwrap_or_default();
         let policy = opt_field::<UpdatePolicy>(&mut table, "policy", path_for_errors)?
@@ -751,6 +760,7 @@ impl AppFile {
             allow_insecure_http,
             proxy,
             installed_version_cmd,
+            post_install_check_cmd,
             install,
             source_kind,
         })
@@ -938,6 +948,28 @@ mod tests {
         assert_eq!(cmd[0], "sh");
         assert_eq!(cmd[1], "-c");
         assert!(cmd[2].contains("build"));
+    }
+
+    #[test]
+    fn post_install_check_is_common_and_requires_an_executable() {
+        let base = serde_json::json!({"id": "x", "provider": "external:plugin", "custom": 1});
+        let app = AppFile::parse_value(base.clone(), "x.json").unwrap();
+        assert!(app.post_install_check_cmd.is_none());
+        let mut value = base.clone();
+        value["post_install_check_cmd"] = serde_json::json!(["check", "--ready"]);
+        let app = AppFile::parse_value(value, "x.json").unwrap();
+        assert_eq!(app.post_install_check_cmd.unwrap(), ["check", "--ready"]);
+        if let SourceKind::External { raw, .. } = app.source_kind {
+            assert!(raw.get("post_install_check_cmd").is_none());
+        } else {
+            panic!("expected external provider");
+        }
+        for cmd in [serde_json::json!([]), serde_json::json!([""]), serde_json::json!(["  "])] {
+            let mut value = base.clone();
+            value["post_install_check_cmd"] = cmd;
+            let err = AppFile::parse_value(value, "x.json").unwrap_err().to_string();
+            assert!(err.contains("post_install_check_cmd") && err.contains("x.json"));
+        }
     }
 
     #[test]

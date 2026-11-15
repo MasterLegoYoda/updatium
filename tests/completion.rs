@@ -166,3 +166,70 @@ type = "none"
     assert!(report.installed && report.recorded, "{report:?}");
     assert!(engine.pending_update("demo").unwrap().is_none());
 }
+
+#[tokio::test]
+async fn health_failure_reports_completed_install_separately() {
+    let home = tempfile::tempdir().unwrap();
+    let marker = home.path().join("installed");
+    write_app(home.path(), "demo", &format!(r#"
+id = "demo"
+provider = "command"
+check_cmd = ["printf", "2.0.0"]
+apply_cmd = ["touch", "{}"]
+post_install_check_cmd = ["false"]
+[install]
+type = "none"
+"#, marker.display()));
+    let (exit, report) = cli_update(home.path(), "demo");
+    assert_eq!(exit, 2, "{report}");
+    assert_eq!(report[0]["installed"], true);
+    assert_eq!(report[0]["recorded"], true);
+    assert_eq!(report[0]["verified"], false);
+    assert!(report[0]["failed"].is_null());
+    assert!(report[0]["integration_failures"].to_string().contains("health check failed"));
+    assert!(marker.exists());
+    assert_eq!(Engine::new(Some(home.path())).unwrap().installed_version("demo").await.unwrap().as_deref(), Some("2.0.0"));
+}
+
+#[tokio::test]
+async fn managed_versions_are_retained_and_explicitly_restored() {
+    let repo = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git").args(args).current_dir(repo.path())
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .status().unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(repo.path().join("build.sh"), "cp content tool\n").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_app(home.path(), "demo", &format!(r#"
+id = "demo"
+provider = "source-build"
+repo_url = "{}"
+ref_regex = '^refs/tags/b\d+$'
+post_install_check_cmd = ["true"]
+[build]
+steps = [["sh", "build.sh"]]
+tracked_files = ["build.sh"]
+artifacts = ["tool"]
+[install]
+type = "dir"
+"#, repo.path().display()));
+    let engine = Engine::new(Some(home.path())).unwrap();
+    for version in ["b1000", "b2000", "b3000", "b4000"] {
+        std::fs::write(repo.path().join("content"), version).unwrap();
+        git(&["add", "."]); git(&["commit", "-qm", version]); git(&["tag", version]);
+        let report = engine.update("demo", &UpdateOpts::default()).await.unwrap();
+        assert!(report.installed && report.recorded && report.verified == Some(true), "{report:?}");
+    }
+    let path = home.path().join("state/installs/demo/current/tool");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "b4000");
+    assert_eq!(engine.rollback_versions("demo").unwrap(), ["b3000", "b2000"]);
+    assert_eq!(engine.rollback("demo", Some("b2000")).unwrap(), "b2000");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "b2000");
+    assert_eq!(engine.installed_version("demo").await.unwrap().as_deref(), Some("b2000"));
+    assert!(engine.pending_update("demo").unwrap().is_none());
+    assert!(engine.history(Some("demo"), 100).unwrap().iter().any(|event| event.kind == "rollback_ok"));
+}

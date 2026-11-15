@@ -27,6 +27,9 @@ pub struct Release {
     pub version: String,
     #[serde(default)]
     pub published_at: Option<DateTime<Utc>>,
+    /// Upstream release notes or changelog URL, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_url: Option<url::Url>,
     #[serde(default)]
     pub assets: Vec<Asset>,
 }

@@ -38,6 +38,7 @@ impl Provider for Command {
             .map(|v| Release {
                 version: v.to_string(),
                 published_at: None,
+                release_url: None,
                 assets: vec![],
             })
             .collect())

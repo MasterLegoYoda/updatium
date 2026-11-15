@@ -19,6 +19,7 @@ fn app(extra: &str) -> AppFile {
 fn release(version: &str, names: &[&str]) -> Release {
     Release {
         version: version.into(), published_at: None,
+        release_url: None,
         assets: names.iter().map(|name| Asset {
             name: (*name).into(), url: url::Url::parse(&format!("https://example.com/{name}")).unwrap(),
             size: None, digest: None,

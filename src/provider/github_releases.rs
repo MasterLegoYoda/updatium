@@ -27,6 +27,8 @@ struct GhRelease {
     #[serde(default)]
     published_at: Option<DateTime<chrono::Utc>>,
     #[serde(default)]
+    html_url: Option<serde_json::Value>,
+    #[serde(default)]
     assets: Vec<GhAsset>,
 }
 
@@ -180,6 +182,9 @@ impl Provider for GithubReleases {
                 out.push(Release {
                     version: tag,
                     published_at: r.published_at,
+                    release_url: r.html_url.as_ref().and_then(|value| value.as_str())
+                        .and_then(|raw| url::Url::parse(raw).ok())
+                        .filter(|url| matches!(url.scheme(), "http" | "https")),
                     assets,
                 });
             }

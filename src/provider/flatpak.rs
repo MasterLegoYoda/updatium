@@ -130,6 +130,7 @@ pub fn parse_remote_ls(
         out.push(Release {
             version: resolved.to_string(),
             published_at: None,
+            release_url: None,
             assets: vec![],
         });
     }
