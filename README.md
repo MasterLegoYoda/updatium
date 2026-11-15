@@ -404,6 +404,43 @@ are not ordered against other branches. If `version_field = "branch"`, a fixed
 branch name cannot identify changes to its underlying commit. `check` lists the
 remote with `flatpak remote-ls --user|--system <remote> --app`.
 
+## Update policies
+
+Add an optional `[policy]` table to an app file (the same fields work in YAML
+and JSON). Omitted settings impose no restriction:
+
+```toml
+[policy]
+hold = false              # true: check for releases but do not apply updates
+pin = "v1.8.0"            # only this exact provider version is eligible
+skip = ["v1.7.2"]         # exact releases to exclude, not later releases
+manual = true             # exclude from bulk updates; allow update <id>
+```
+
+Alternatively, replace `pin` with a SemVer requirement such as `range = "^1"`
+to stay on major version 1. Ranges are supported only for GitHub releases and
+HTML links with strict three-component SemVer versions (an optional `v` or `V`
+prefix is accepted). Unsupported providers and non-SemVer candidates fail
+explicitly; Debian package versions and branch names are not treated as SemVer.
+Pin and skip use exact provider strings, including any prefix. Pin and range
+cannot be combined; a pin cannot also be skipped. A pin never causes an
+automatic downgrade; `--force` can select an eligible older version.
+
+Updatium checks releases even while held. It selects the newest eligible release
+newer than the installed version, or reports why candidates are blocked. Check
+and TUI status explain when the newest available release is held, pinned,
+skipped, outside the range, or restricted to manual updates. `manual` excludes
+an app from CLI `update --all` and TUI bulk/marked updates, but not an explicit
+single-app update. `--force` never bypasses any policy.
+
+To release a pin, run `updatium unpin <id>` or remove `policy.pin` from the app
+file. The command preserves other values, comments, and formatting; if it cannot
+do so safely, it refuses and asks you to edit the file. Other restrictions stay
+in effect. Target-version restrictions cannot be enforced for arbitrary apply
+commands or external installers, so Updatium refuses to apply with pin, range,
+or skip configured for those mechanisms. Hold and manual policies remain usable.
+Track-only configurations perform no installation.
+
 ## CLI
 
 ```
@@ -411,6 +448,7 @@ updatium add <id> --provider <p> [--edit] [--format toml|yaml|json]
 updatium list [--json]
 updatium check [ids...|--all] [--json]     # default: all enabled
 updatium update (<id>|--all) [--yes] [--dry-run] [--force]
+updatium unpin <id>
 updatium approve <id> [--show-diff] [--yes]
 updatium history [<id>] [--limit 50] [--json]
 updatium plugins [--json]
@@ -422,7 +460,7 @@ updatium completions <shell>
 Exit codes: `0` success/no-op · `1` error · `2` completed-with-failures or
 pending approvals (script-friendly).
 
-Status markers: `● ok ▲ update ⚠ approval ✖ error · unchecked`.
+Status markers: `● ok ▲ update ⏸ policy ⚠ approval ✖ error · unchecked`.
 `LATEST` is the newest version in the current provider result; versions removed
 by a config filter (such as `tag_regex` or `ref_regex`) do not linger.
 
@@ -443,7 +481,7 @@ version rules.
 
 TUI keys: `/` search · `f` cycle status filters · `r` refresh · `u` update the highlighted app · `U` bulk update eligible apps · `Space` toggle a mark · `s` update marked apps · `c` clear all marks · `a` approve · `j/k/arrows/pgup/pgdn` navigate · `d` app history · `e` edit config in `$EDITOR` · `n` create app · `x` delete config only · `g/G` write/remove desktop entry · `p` plugins · `F1` help · `q` quit. Destructive actions ask for confirmation; app-config deletion retains installed files, desktop entry, and database history/state.
 
-Marks are identified by app ID and persist across searches, status filters, and refreshes; the marked count includes hidden apps. Removed apps are unmarked on refresh. `s` confirms the complete marked list in ID order (scroll with `j/k` or arrows); an empty selection does nothing, and the operation is cancelled if an app is removed or disabled before confirmation. Enabled marked apps can be updated regardless of their displayed status, including apt and flatpak apps. Their configured `apply_cmd` determines the actual operation and may update dependencies or other packages beyond the selected apps; selection does not constrain package-manager side effects.
+Marks are identified by app ID and persist across searches, status filters, and refreshes; the marked count includes hidden apps. Removed apps are unmarked on refresh. `s` confirms the complete marked list in ID order (scroll with `j/k` or arrows); an empty selection does nothing, and the operation is cancelled if an app is removed or disabled before confirmation. Marked updates respect all policies, including `manual`. For eligible apt and flatpak apps, the configured `apply_cmd` determines the actual operation and may update dependencies or other packages beyond the selected apps; selection does not constrain package-manager side effects.
 
 During an update, the activity line shows the current app and stage. Asset downloads show bytes received and, when the server provides a content length, the total and percentage. Git, package-manager, Docker, and plugin operations report their stage but not internal transfer progress.
 

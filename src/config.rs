@@ -594,12 +594,52 @@ pub struct AppSource {
 // AppFile: parsed apps.d/<id>.toml
 // ---------------------------------------------------------------------------
 
+/// Update restrictions shared by all providers.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdatePolicy {
+    pub hold: bool,
+    pub pin: Option<String>,
+    pub range: Option<String>,
+    pub skip: Vec<String>,
+    pub manual: bool,
+}
+
+impl UpdatePolicy {
+    fn validate(&self, provider: &str) -> Result<()> {
+        if self.pin.as_ref().is_some_and(|s| s.trim().is_empty()) {
+            bail!("policy.pin must not be empty");
+        }
+        if self.skip.iter().any(|s| s.trim().is_empty()) {
+            bail!("policy.skip must not contain empty versions");
+        }
+        if self.pin.is_some() && self.range.is_some() {
+            bail!("policy.pin and policy.range cannot be combined");
+        }
+        if self.pin.as_ref().is_some_and(|pin| self.skip.contains(pin)) {
+            bail!("policy.pin cannot also appear in policy.skip");
+        }
+        if let Some(range) = &self.range {
+            if range.trim().is_empty() {
+                bail!("policy.range must not be empty");
+            }
+            if !matches!(provider, "github-releases" | "html-links") {
+                bail!("policy.range is unsupported for provider '{provider}'");
+            }
+            semver::VersionReq::parse(range)
+                .map_err(|e| anyhow::anyhow!("invalid policy.range '{range}': {e}"))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppFile {
     pub id: String,
     pub provider: String,
     pub enabled: bool,
     pub digest_policy: DigestPolicy,
+    pub policy: UpdatePolicy,
     pub allow_insecure_http: bool,
     pub proxy: Option<String>,
     /// Optional authoritative version probe, consulted even after an update.
@@ -659,6 +699,9 @@ impl AppFile {
             opt_field::<Vec<String>>(&mut table, "installed_version_cmd", path_for_errors)?;
         let install =
             opt_field::<InstallCfg>(&mut table, "install", path_for_errors)?.unwrap_or_default();
+        let policy = opt_field::<UpdatePolicy>(&mut table, "policy", path_for_errors)?
+            .unwrap_or_default();
+        policy.validate(&provider).map_err(|e| anyhow::anyhow!("{path_for_errors}: invalid policy: {e}"))?;
 
         // Pass 2: everything left belongs to the provider-specific struct
         // (or the external plugin), which enforces its own unknown-field denial.
@@ -704,6 +747,7 @@ impl AppFile {
             provider,
             enabled,
             digest_policy,
+            policy,
             allow_insecure_http,
             proxy,
             installed_version_cmd,

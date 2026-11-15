@@ -27,6 +27,8 @@ pub enum Status {
     UpdateAvailable,
     NeedsApproval,
     Disabled,
+    /// An available release is excluded from bulk updates by policy.
+    Policy(String),
     Error(String),
 }
 
@@ -38,6 +40,7 @@ impl Status {
             Status::UpdateAvailable => "▲ update",
             Status::NeedsApproval => "⚠ approval",
             Status::Disabled => "○ disabled",
+            Status::Policy(_) => "⏸ policy",
             Status::Error(_) => "✖ error",
         }
     }
@@ -278,7 +281,7 @@ impl Engine {
                     // filters (tag_regex, prereleases, ref_regex) can remove a
                     // previously seen version from the current result set.
                     let latest = versions.first().cloned();
-                    let status = if let Some(version) = self.pending_update(&app.id)? {
+                    let mut status = if let Some(version) = self.pending_update(&app.id)? {
                         Status::Error(format!("update to {version} is incomplete or still running; installed state may be stale"))
                     } else if pending {
                         Status::NeedsApproval
@@ -306,6 +309,15 @@ impl Engine {
                             },
                         }
                     };
+                    if matches!(status, Status::UpdateAvailable | Status::NeverChecked) {
+                        if let Some(version) = &latest {
+                            match crate::policy::reason(&app, version, true) {
+                                Ok(Some(reason)) => status = Status::Policy(reason),
+                                Err(error) => status = Status::Error(format!("policy: {error:#}")),
+                                Ok(None) => {}
+                            }
+                        }
+                    }
                     reports.push(CheckReport {
                         app: app.id,
                         provider: app.provider,
@@ -376,12 +388,29 @@ impl Engine {
         self.update_with_progress(id, o, &|_| {}).await
     }
 
+    /// Update an app as part of a bulk operation; manual policy is respected.
+    pub async fn update_bulk(&self, id: &str, o: &UpdateOpts) -> Result<UpdateReport> {
+        self.update_bulk_with_progress(id, o, &|_| {}).await
+    }
+
+    pub async fn update_bulk_with_progress(
+        &self, id: &str, o: &UpdateOpts, progress: ProgressCallback<'_>,
+    ) -> Result<UpdateReport> {
+        self.update_inner(id, o, progress, true).await
+    }
+
     /// Run an update while reporting its current stage and asset download progress.
     pub async fn update_with_progress(
         &self,
         id: &str,
         o: &UpdateOpts,
         progress: ProgressCallback<'_>,
+    ) -> Result<UpdateReport> {
+        self.update_inner(id, o, progress, false).await
+    }
+
+    async fn update_inner(
+        &self, id: &str, o: &UpdateOpts, progress: ProgressCallback<'_>, bulk: bool,
     ) -> Result<UpdateReport> {
         progress(UpdateProgress::Stage("Checking for updates"));
         // Step 1: pick target version.
@@ -442,18 +471,27 @@ impl Engine {
         releases.sort_by(|a, b| compare_app_versions(&app.source_kind, &b.version, &a.version));
         releases.dedup_by(|a, b| a.version == b.version);
 
+        // Evaluate every newer candidate in order. Skipping the newest release
+        // must not hide an older allowed update or a later future release.
+        let mut chosen = None;
+        let mut blocked = None;
+        for release in &releases {
+            if !o.force && from.as_deref().is_some_and(|i| compare_app_versions(&app.source_kind, &release.version, i) != std::cmp::Ordering::Greater) {
+                continue;
+            }
+            match crate::policy::reason(&app, &release.version, bulk) {
+                Ok(None) => { chosen = Some(release.clone()); break; }
+                Ok(Some(reason)) => {
+                    if blocked.is_none() { blocked = Some(format!("{}: {reason}", release.version)); }
+                }
+                Err(error) => return Ok(UpdateReport {
+                    app: id.to_owned(), from, warnings: probe_warnings,
+                    failed: Some(format!("update policy: {error:#}")), ..Default::default()
+                }),
+            }
+        }
+
         let target: Release = {
-            let chosen = match (&from, o.force) {
-                // Forced run always takes the newest known release.
-                (_, true) => releases.first().cloned(),
-                // Nothing recorded yet: latest.
-                (None, _) => releases.first().cloned(),
-                // Otherwise only strictly newer than installed.
-                (Some(i), _) => releases
-                    .iter()
-                    .find(|r| compare_app_versions(&app.source_kind, &r.version, i) == std::cmp::Ordering::Greater)
-                    .cloned(),
-            };
             match chosen {
                 Some(r) => r,
                 None if pending.is_some() && !o.dry_run => {
@@ -473,13 +511,27 @@ impl Engine {
                         installed: false,
                         recorded: false,
                         integration_failures: vec![],
-                        actions: vec!["nothing to do".into()],
+                        actions: vec![blocked.unwrap_or_else(|| "nothing to do".into())],
                         warnings: probe_warnings,
                         failed: None,
                     });
                 }
             }
         };
+
+        // Arbitrary apply commands and external installers do not guarantee that
+        // they install the selected version. Never claim to enforce a target
+        // restriction when the application mechanism can ignore it.
+        if !track_only && (app.policy.pin.is_some() || app.policy.range.is_some() || !app.policy.skip.is_empty())
+            && (matches!(app.source_kind, SourceKind::Command(_) | SourceKind::Apt(_) | SourceKind::Flatpak(_) | SourceKind::DockerRegistry(_) | SourceKind::External { .. })
+                || matches!(app.install.kind, InstallType::External(_)))
+        {
+            return Ok(UpdateReport {
+                app: id.to_owned(), from, to: Some(target.version), warnings: probe_warnings,
+                failed: Some("version pin/range/skip cannot be enforced for arbitrary apply commands or external installers".into()),
+                ..Default::default()
+            });
+        }
 
         let mut rep = UpdateReport {
             app: id.to_string(),

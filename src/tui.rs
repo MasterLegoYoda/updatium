@@ -53,7 +53,7 @@ async fn frame_rows(engine: &Engine) -> Vec<UiRow> {
             } else if let Some(error) = latest_error {
                 Status::Error(error)
             } else {
-                status_from_versions(&app.source_kind, installed.version.as_deref(), latest.as_deref())
+                status_from_versions(&app, installed.version.as_deref(), latest.as_deref())
             };
             let (config_path, config_issue) = match app_config_path_in(engine, &app.id) {
                 Ok(path) => (Some(path), None),
@@ -107,16 +107,33 @@ async fn render_db_frame(engine: &Engine) -> String {
                 output.push_str(&format!("\n{}: {message}", row.app));
             }
         }
+        if let Status::Policy(reason) = &row.status {
+            output.push_str(&format!("\n{}: {reason}", row.app));
+        }
     }
     output
 }
 
-fn status_from_versions(kind: &config::SourceKind, installed: Option<&str>, latest: Option<&str>) -> Status {
+fn status_from_versions(app: &config::AppFile, installed: Option<&str>, latest: Option<&str>) -> Status {
+    let status = version_status(app, installed, latest);
+    if matches!(status, Status::UpdateAvailable | Status::NeverChecked) {
+        if let Some(version) = latest {
+            return match crate::policy::reason(app, version, true) {
+                Ok(Some(reason)) => Status::Policy(reason),
+                Ok(None) => status,
+                Err(error) => Status::Error(format!("policy: {error:#}")),
+            };
+        }
+    }
+    status
+}
+
+fn version_status(app: &config::AppFile, installed: Option<&str>, latest: Option<&str>) -> Status {
     match (installed, latest) {
         (Some(installed), Some(latest)) => {
-            if let Err(error) = crate::engine::ensure_same_version_class(kind, latest, installed) {
+            if let Err(error) = crate::engine::ensure_same_version_class(&app.source_kind, latest, installed) {
                 Status::Error(error.to_string())
-            } else if crate::engine::compare_app_versions(kind, latest, installed) == std::cmp::Ordering::Greater {
+            } else if crate::engine::compare_app_versions(&app.source_kind, latest, installed) == std::cmp::Ordering::Greater {
                 Status::UpdateAvailable
             } else {
                 Status::Ok
@@ -268,13 +285,13 @@ fn worker_loop(home: Option<PathBuf>, cmd_rx: mpsc::Receiver<Cmd>, msg_tx: mpsc:
         match command {
             Cmd::Refresh => worker_refresh(&engine, &runtime, &msg_tx),
             Cmd::Update(id) => {
-                worker_update(&engine, &runtime, &msg_tx, &id);
+                worker_update(&engine, &runtime, &msg_tx, &id, false);
                 worker_refresh(&engine, &runtime, &msg_tx);
             }
             Cmd::UpdateMany(mut ids) => {
                 ids.sort();
                 for id in ids {
-                    worker_update(&engine, &runtime, &msg_tx, &id);
+                    worker_update(&engine, &runtime, &msg_tx, &id, true);
                 }
                 worker_refresh(&engine, &runtime, &msg_tx);
             }
@@ -370,14 +387,17 @@ fn worker_update(
     runtime: &tokio::runtime::Runtime,
     tx: &mpsc::Sender<UiMsg>,
     id: &str,
+    bulk: bool,
 ) {
-    let result = runtime.block_on(engine.update_with_progress(
-        id,
-        &crate::engine::UpdateOpts::default(),
-        &|progress| {
-            let _ = tx.send(UiMsg::Progress(Some((id.to_owned(), progress))));
-        },
-    ));
+    let opts = crate::engine::UpdateOpts::default();
+    let progress = |progress| {
+        let _ = tx.send(UiMsg::Progress(Some((id.to_owned(), progress))));
+    };
+    let result = if bulk {
+        runtime.block_on(engine.update_bulk_with_progress(id, &opts, &progress))
+    } else {
+        runtime.block_on(engine.update_with_progress(id, &opts, &progress))
+    };
     let _ = tx.send(UiMsg::Progress(None));
     let _ = tx.send(UiMsg::Activity(update_result(id, result)));
 }
@@ -497,7 +517,7 @@ fn worker_refresh(
                 } else if let Some(diagnostic) = &installed_diagnostic {
                     Status::Error(diagnostic.clone())
                 } else {
-                    status_from_versions(&app.source_kind, installed.as_deref(), latest.as_deref())
+                    status_from_versions(&app, installed.as_deref(), latest.as_deref())
                 };
                 let (config_path, config_issue) = match app_config_path_in(engine, &app.id) {
                     Ok(path) => (Some(path), None),
@@ -1333,6 +1353,7 @@ fn draw_app_screen(f: &mut Frame, area: Rect, ui: &UiState, visible: &[usize]) {
         .map(|(position, row)| {
             let label = match &row.status {
                 Status::Error(error) => format!("✖ error: {error}"),
+                Status::Policy(reason) => format!("policy: {reason}"),
                 status => status.label().to_string(),
             };
             let selected_style = if position == ui.selected {
@@ -1386,6 +1407,7 @@ fn status_style(status: &Status) -> Style {
         Status::Ok => Style::default().fg(Color::Green),
         Status::UpdateAvailable => Style::default().fg(Color::Cyan),
         Status::NeedsApproval => Style::default().fg(Color::Yellow),
+        Status::Policy(_) => Style::default().fg(Color::Yellow),
         Status::Error(_) => Style::default().fg(Color::Red),
         Status::Disabled | Status::NeverChecked => Style::default().fg(Color::DarkGray),
     }
@@ -1409,6 +1431,9 @@ fn render_detail(
             if row.installed_diagnostic.as_deref() != Some(message.as_str()) {
                 lines.push(Line::from(format!("error: {message}")));
             }
+        }
+        if let Status::Policy(reason) = &row.status {
+            lines.push(Line::from(format!("policy: {reason}")));
         }
         lines.push(Line::from(format!(
             "installed: {}",
@@ -1622,6 +1647,18 @@ mod tests {
             config_path: None,
             config_issue: None,
         }
+    }
+
+    #[test]
+    fn snapshot_applies_bulk_policy_to_known_latest() {
+        let app = config::AppFile::parse(
+            "id = 'demo'\nprovider = 'github-releases'\nrepo = 'owner/repo'\nasset_regex = '.*'\n[policy]\nmanual = true\n",
+            "demo.toml",
+        ).unwrap();
+        assert!(matches!(status_from_versions(&app, Some("1.0.0"), Some("2.0.0")), Status::Policy(_)));
+        assert!(matches!(status_from_versions(&app, None, Some("2.0.0")), Status::Policy(_)));
+        assert!(matches!(status_from_versions(&app, Some("2.0.0"), Some("2.0.0")), Status::Ok));
+        assert!(matches!(status_from_versions(&app, None, None), Status::NeverChecked));
     }
 
     #[test]

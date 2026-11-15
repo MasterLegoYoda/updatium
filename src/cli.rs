@@ -111,6 +111,11 @@ pub enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Release an app's version pin without changing its other policies
+    Unpin {
+        /// App identifier
+        id: String,
+    },
     /// Clear a source-build script-change gate after review
     Approve {
         id: String,
@@ -178,6 +183,7 @@ pub fn render_table(rows: &[TableRow]) -> String {
     let headers = ["ID", "PROVIDER", "INSTALLED", "LATEST", "STATUS"];
     let status_str = |s: &Status| match s {
         Status::Error(e) => format!("✖ error ({e})"),
+        Status::Policy(reason) => format!("policy ({reason})"),
         other => other.label().to_string(),
     };
     let body: Vec<[String; 5]> = rows
@@ -439,6 +445,164 @@ type = "none"
     Ok(path)
 }
 
+
+/// Remove only the policy pin from the format-independent configuration value.
+fn clear_pin(home: Option<&Path>, id: &str) -> Result<bool> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    anyhow::ensure!(
+        !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "app id must be [a-zA-Z0-9_-]: {id:?}"
+    );
+    let engine = Engine::new(home)?;
+    let dir = engine.home_paths().apps_d();
+    let dir_meta = std::fs::symlink_metadata(&dir).with_context(|| format!("reading {}", dir.display()))?;
+    anyhow::ensure!(dir_meta.is_dir() && !dir_meta.file_type().is_symlink(), "refusing symlink or non-directory {}", dir.display());
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.file_stem().and_then(|s| s.to_str()) == Some(id)
+            && path.extension().and_then(|s| s.to_str()).and_then(crate::config::ConfigFormat::from_extension).is_some()
+        {
+            matches.push(path);
+        }
+    }
+    anyhow::ensure!(matches.len() == 1, "expected exactly one config for '{id}', found {}", matches.len());
+    let path = &matches[0];
+    let mut file = std::fs::OpenOptions::new().read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(path).with_context(|| format!("opening {} without following symlinks", path.display()))?;
+    let original_meta = file.metadata()?;
+    anyhow::ensure!(original_meta.is_file(), "not a regular file: {}", path.display());
+    let mut original = String::new();
+    file.read_to_string(&mut original)?;
+    let format = crate::config::ConfigFormat::from_path(path)?;
+    let mut value = format.parse(&original).with_context(|| format!("parsing {}", path.display()))?;
+    anyhow::ensure!(value.get("id").and_then(|v| v.as_str()) == Some(id), "config id does not match filename: {}", path.display());
+    let Some(policy) = value.get_mut("policy") else { return Ok(false) };
+    let policy = policy.as_object_mut().context("policy must be a table")?;
+    if policy.remove("pin").is_none() { return Ok(false); }
+    let updated = remove_pin_text(format, &original, &value).with_context(|| format!(
+        "cannot safely remove pin while preserving comments and formatting; edit {} and remove policy.pin manually", path.display()
+    ))?;
+    let mut tmp = tempfile::Builder::new().prefix(".updatium-unpin-").tempfile_in(&dir)?;
+    tmp.as_file().set_permissions(original_meta.permissions())?;
+    tmp.write_all(updated.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    // Detect replacements and ordinary concurrent edits before the atomic rename.
+    // A writer racing between this check and rename cannot be excluded here.
+    let current = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(current.is_file() && current.dev() == original_meta.dev()
+        && current.ino() == original_meta.ino() && current.len() == original_meta.len()
+        && current.mtime() == original_meta.mtime() && current.mtime_nsec() == original_meta.mtime_nsec()
+        && current.ctime() == original_meta.ctime() && current.ctime_nsec() == original_meta.ctime_nsec(),
+        "config changed while releasing pin: {}", path.display());
+    tmp.persist(path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(true)
+}
+
+/// Make a narrowly scoped textual edit and verify its parsed meaning before writing.
+fn remove_pin_text(format: crate::config::ConfigFormat, original: &str, expected: &serde_json::Value) -> Result<String> {
+    let valid = |candidate: &str| format.parse(candidate).is_ok_and(|parsed| parsed == *expected);
+    match format {
+        crate::config::ConfigFormat::Toml | crate::config::ConfigFormat::Yaml => {
+            let pattern = match format {
+                crate::config::ConfigFormat::Toml => r"^\s*pin\s*=",
+                _ => r"^\s*pin\s*:",
+            };
+            let key = regex::Regex::new(pattern)?;
+            let mut offset = 0;
+            for line in original.split_inclusive('\n') {
+                // Never discard a comment, even one attached to the pin itself.
+                if !line.contains('#') && key.is_match(line) {
+                    let mut candidate = original.to_owned();
+                    candidate.replace_range(offset..offset + line.len(), "");
+                    if valid(&candidate) { return Ok(candidate); }
+                }
+                offset += line.len();
+            }
+        }
+        crate::config::ConfigFormat::Json => {
+            // JSON has no comments; only remove the key/value and one separator.
+            let key_value = regex::Regex::new(r#""pin"\s*:\s*"(?:\\.|[^"\\])*""#)?;
+            for found in key_value.find_iter(original) {
+                let before = &original[..found.start()];
+                let after = &original[found.end()..];
+                let next = after.len() - after.trim_start().len();
+                let prev = before.trim_end().len();
+                let mut ranges = vec![(found.start(), found.end())];
+                if after.as_bytes().get(next) == Some(&b',') {
+                    ranges.push((found.start(), found.end() + next + 1));
+                }
+                if prev > 0 && before.as_bytes()[prev - 1] == b',' {
+                    ranges.push((prev - 1, found.end()));
+                }
+                for (start, end) in ranges {
+                    let mut candidate = original.to_owned();
+                    candidate.replace_range(start..end, "");
+                    if valid(&candidate) { return Ok(candidate); }
+                }
+            }
+        }
+    }
+    bail!("no formatting-preserving edit found")
+}
+
+#[cfg(test)]
+mod unpin_tests {
+    use super::*;
+
+    #[test]
+    fn unpin_preserves_comments_and_refuses_inline_comment() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("config/apps.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("example.toml");
+        let original = "# top\nid = 'example'\nprovider = 'github-releases'\n[policy]\n# keep\npin = '1.0'\nhold = true # keep too\n";
+        std::fs::write(&path, original).unwrap();
+        assert!(clear_pin(Some(home.path()), "example").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original.replace("pin = '1.0'\n", ""));
+        let inline = original.replace("pin = '1.0'", "pin = '1.0' # important");
+        std::fs::write(&path, &inline).unwrap();
+        assert!(clear_pin(Some(home.path()), "example").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), inline);
+    }
+
+    #[test]
+    fn unpin_preserves_other_values_in_all_formats() {
+        for (ext, text) in [
+            ("toml", "id = 'example'\nprovider = 'github-releases'\n[policy]\npin = '1.0'\nhold = true\n"),
+            ("yaml", "id: example\nprovider: github-releases\npolicy:\n  pin: '1.0'\n  hold: true\n"),
+            ("json", r#"{"id":"example","provider":"github-releases","policy":{"pin":"1.0","hold":true}}"#),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let dir = home.path().join("config/apps.d");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("example.{ext}"));
+            std::fs::write(&path, text).unwrap();
+            let fmt = crate::config::ConfigFormat::from_path(&path).unwrap();
+            let mut expected = fmt.parse(text).unwrap();
+            expected["policy"].as_object_mut().unwrap().remove("pin");
+            assert!(clear_pin(Some(home.path()), "example").unwrap());
+            assert_eq!(fmt.parse(&std::fs::read_to_string(&path).unwrap()).unwrap(), expected);
+            assert!(!clear_pin(Some(home.path()), "example").unwrap());
+        }
+    }
+
+    #[test]
+    fn unpin_refuses_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("config/apps.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = home.path().join("target");
+        std::fs::write(&target, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("example.toml")).unwrap();
+        assert!(clear_pin(Some(home.path()), "example").is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
+    }
+}
+
 pub(crate) fn edit_config(path: &Path) -> Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
     let status = std::process::Command::new(editor).arg(path).status()?;
@@ -506,6 +670,17 @@ fn dispatch(cli: &Cli) -> Result<i32> {
         }
         Cmd::Validate { id } => {
             tokio::runtime::Runtime::new()?.block_on(crate::onboarding::validate_config(cli.home.as_deref(), id))?;
+            Ok(0)
+        }
+        Cmd::Unpin { id } => {
+            let changed = clear_pin(cli.home.as_deref(), id)?;
+            if cli.json {
+                println!("{}", serde_json::json!({"app": id, "pin_removed": changed}));
+            } else if changed {
+                println!("released version pin for '{id}'");
+            } else {
+                println!("no version pin configured for '{id}'");
+            }
             Ok(0)
         }
         Cmd::List { json } => {
@@ -578,9 +753,11 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                                     Status::UpdateAvailable => "update_available",
                                     Status::NeedsApproval => "needs_approval",
                                     Status::Disabled => "disabled",
+                                    Status::Policy(_) => "policy",
                                     Status::Error(_) => "error",
                                 },
                                 "error": match &r.status { Status::Error(m) => Some(m), _ => None },
+                                "policy_reason": match &r.status { Status::Policy(m) => Some(m), _ => None },
                             })
                         })
                         .collect();
@@ -619,7 +796,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 let mut any_pending = false;
                 let mut update_reports = Vec::new();
                 for tid in &ids {
-                    let rep = e.update(tid, &opts).await?;
+                    let rep = if *all { e.update_bulk(tid, &opts).await? } else { e.update(tid, &opts).await? };
                     if let Some(f) = &rep.failed {
                         failures.push(format!("{}: {f}", rep.app));
                     }

@@ -13,6 +13,7 @@ mod onboarding;
 pub mod onboarding_validation;
 pub mod recipes;
 pub mod provider;
+pub mod policy;
 pub mod store;
 pub mod tui;
 pub mod version;

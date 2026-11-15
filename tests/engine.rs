@@ -133,6 +133,42 @@ async fn full_appimage_lifecycle() {
 }
 
 #[tokio::test]
+async fn update_policy_controls_checks_and_target_selection() {
+    let (base, _guard) = common::spawn().await;
+    let home = tempfile::tempdir().unwrap();
+    let configure = |policy: &str| {
+        write_app(home.path(), "demo", &format!("{}\n[policy]\n{policy}\n", GH_APP_TMPL.replace("{base}", &base)));
+    };
+    let e = engine(home.path());
+    let dry = UpdateOpts { dry_run: true, ..Default::default() };
+
+    configure("hold = true");
+    let report = e.check(None).await.unwrap().remove(0);
+    assert_eq!(report.latest.as_deref(), Some("v2.1.0"));
+    assert!(matches!(&report.status, Status::Policy(reason) if reason.contains("held")));
+    let held = e.update("demo", &UpdateOpts { force: true, ..dry.clone() }).await.unwrap();
+    assert!(held.actions.iter().any(|action| action.contains("held")), "{held:?}");
+    assert!(!held.installed);
+
+    configure("pin = 'v1.8.0'");
+    assert_eq!(e.update("demo", &dry).await.unwrap().to.as_deref(), Some("v1.8.0"));
+    configure("range = '^1'");
+    assert_eq!(e.update("demo", &dry).await.unwrap().to.as_deref(), Some("v1.8.0"));
+    configure("skip = ['v2.1.0']");
+    let report = e.check(None).await.unwrap().remove(0);
+    assert!(matches!(&report.status, Status::Policy(reason) if reason.contains("skipped")));
+    assert_eq!(e.update("demo", &dry).await.unwrap().to.as_deref(), Some("v1.8.0"));
+    configure("skip = ['v1.8.0']");
+    assert_eq!(e.update("demo", &dry).await.unwrap().to.as_deref(), Some("v2.1.0"));
+
+    configure("manual = true");
+    let bulk = e.update_bulk("demo", &dry).await.unwrap();
+    assert!(bulk.actions.iter().any(|action| action.contains("manual")), "{bulk:?}");
+    assert_eq!(e.update("demo", &dry).await.unwrap().to.as_deref(), Some("v2.1.0"));
+    assert!(!home.path().join("state/Applications").exists());
+}
+
+#[tokio::test]
 async fn latest_comes_from_current_result_not_stale_history() {
     let (base, _guard) = common::spawn().await;
     let home = tempfile::tempdir().unwrap();
