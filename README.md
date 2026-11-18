@@ -19,10 +19,16 @@ counterparts. Builtin command, package-manager, Docker, and source-build flows
 still have explicit engine dispatch because their apply operations differ.
 The engine is also a reusable library.
 
-## Build and install from source
+## Install
 
-Prebuilt binary distribution is deferred. On Linux, the included installer
-builds the release binary from the checkout and installs it into `~/.local/bin`:
+Download a Linux x86-64 or ARM64 build from the [releases page](https://github.com/MasterLegoYoda/updatium/releases),
+or build and install from source below. Prebuilt binaries require a system
+compatible with Ubuntu 24.04's libraries.
+
+### Build and install from source
+
+On Linux, the included installer builds the release binary from the checkout
+and installs it into `~/.local/bin`:
 
 ```bash
 ./install.sh
