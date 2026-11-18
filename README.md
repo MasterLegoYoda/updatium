@@ -1,7 +1,29 @@
 # updatium
 
-One tool that tracks and applies updates for software delivered through
-heterogeneous channels:
+Software updates do not all come from a package manager. An AppImage might live
+on GitHub, a container in a registry, and a tool you built yourself in a Git
+checkout. Updatium brings those different release channels into one Linux update
+workflow: discover versions, review what will change, and apply updates using
+the installation method configured for each app.
+
+Use it from the command line or the terminal dashboard. Start with guided
+onboarding, describe an existing installation with a version probe, or extend
+the engine with provider and installer plugins. Updates can have side effects:
+review your configuration and the recovery guidance before applying them.
+
+## Find your way
+
+- **Get started:** [Install](#install) and try the [quickstart](#quickstart).
+- **Configure:** [runtime layout](#runtime-layout), [global config](#global-configtoml),
+  [app files and provider fields](#app-files-appsdidtoml), and [update policies](#update-policies).
+- **Operate safely:** [plans, verification, and recovery](#update-plans-verification-and-recovery),
+  [cleanup](#untracking-uninstalling-and-cleanup), and the [security model](#security-model).
+- **Go further:** [CLI and dashboard](#cli), [external providers](#external-provider-protocol-v2),
+  [installer plugins](#installer-plugins), and [development](#development).
+
+## Supported channels
+
+Providers discover releases from these sources:
 
 | Channel | Provider id | Example |
 |---|---|---|
@@ -22,8 +44,9 @@ The engine is also a reusable library.
 ## Install
 
 Download a Linux x86-64 or ARM64 build from the [releases page](https://github.com/MasterLegoYoda/updatium/releases),
-or build and install from source below. Prebuilt binaries require a system
-compatible with Ubuntu 24.04's libraries.
+or build and install from source below. Release binaries are statically linked
+with musl, so they do not require Ubuntu's shared libraries. They still require
+a compatible Linux kernel and CPU; HTTPS requires system CA certificates.
 
 ### Build and install from source
 
@@ -161,8 +184,8 @@ The AppImage lands in `~/Applications` (mode 0755) and a
 id = "llama.cpp"
 provider = "source-build"
 repo_url = "https://github.com/ggml-org/llama.cpp"
-source_dir = "/home/noesis/Software/llamacpp/llama.cpp"
-install_dir = "/home/noesis/Software/llama.cpp"
+source_dir = "~/Software/llamacpp/llama.cpp"
+install_dir = "~/Software/llama.cpp"
 ref_regex = '^refs/tags/b\d+$'
 installed_version_cmd = ["sh", "-c", "~/Software/llama.cpp/llama-cli --version 2>&1 | sed -n 's/.*build \\([0-9]*\\).*/b\\1/p'"]
 
@@ -268,7 +291,7 @@ When Updatium has no recorded install, it can infer a source-build version from
 the checkout tag if the configured install target exists. A checkout is not
 proof that the installed binaries match it. `tracked_files` are hashed after
 every build. If they change upstream,
-the next update **stops before building** (`⚠ approval`) and snapshots both
+the next update **stops before building** (approval required) and snapshots both
 states. Review and clear with:
 
 ```bash
@@ -616,7 +639,8 @@ updatium completions <shell>
 Exit codes: `0` success/no-op · `1` error · `2` completed-with-failures or
 pending approvals (script-friendly).
 
-Status markers: `● ok ▲ update ⏸ policy ⚠ approval ✖ error · unchecked`.
+Status markers identify ok (U+25CF), update (U+25B2), policy (U+23F8),
+approval (U+26A0), error (U+2716), and unchecked (U+00B7).
 `LATEST` is the newest version in the current provider result; versions removed
 by a config filter (such as `tag_regex` or `ref_regex`) do not linger.
 
@@ -840,3 +864,8 @@ A working end-to-end version of both halves lives in
 cargo test              # unit + integration suites (fixture-server backed)
 bash scripts/e2e.sh     # end-to-end smoke; prints E2E OK
 ```
+
+## License
+
+Updatium is available under the [Unlicense](LICENSE): use, modify, and
+redistribute it for any purpose, without warranty.
