@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - master
 
 permissions:
   contents: write
@@ -66,12 +67,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          tag="main-${GITHUB_SHA}"
+          tag="${GITHUB_REF_NAME}-${GITHUB_SHA}"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" updatium-linux-*.tar.gz updatium-linux-*.tar.gz.sha256 --clobber
           else
             gh release create "$tag" updatium-linux-*.tar.gz updatium-linux-*.tar.gz.sha256 \
               --target "$GITHUB_SHA" \
-              --title "main ${GITHUB_SHA}" \
+              --title "${GITHUB_REF_NAME} ${GITHUB_SHA}" \
               --notes "Automated build for commit ${GITHUB_SHA}."
           fi
