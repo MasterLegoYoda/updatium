@@ -335,7 +335,7 @@ asset_regex = '\.AppImage$'      # optional filter on assets
 include_prereleases = false
 
 [install]
-type = "appimage"                # appimage | archive | dir | none
+type = "appimage"                # appimage | archive | dir | deb | none
 
 [install.desktop]
 name = "<ID>"                    # writes ~/.local/share/applications/updatium.<ID>.desktop

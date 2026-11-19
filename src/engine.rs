@@ -740,6 +740,7 @@ impl Engine {
                     actions.push("automatic rollback is unavailable for AppImages; preserve a backup of the previous executable before updating".into());
                 }
                 InstallType::Archive | InstallType::Dir => actions.push(format!("publish selected artifacts to {}", self.home.install_current(&app.id).display())),
+                InstallType::Deb => actions.push("install .deb package".into()),
                 InstallType::None => {},
                 InstallType::External(n) => actions.push(format!("install via external installer '{n}'")),
             }

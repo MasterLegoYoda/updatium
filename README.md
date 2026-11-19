@@ -417,10 +417,12 @@ Docker daemon may require its own proxy configuration).
 
 ```toml
 [install]
-type = "appimage"                 # appimage | archive | dir | none
+type = "appimage"                 # appimage | archive | dir | deb | none
 target = "~/Applications"         # appimage only; default ~/Applications
 bin_glob = ["bin/llama-cli"]      # archive: staged paths published into current/
 link_bins = ["llama-cli"]         # names symlinked into ~/.local/bin
+install_cmd = ["sudo", "apt-get", "install", "-y", "--allow-downgrades", "{download}"]  # deb only
+timeout_secs = 600                # deb and external installers only
 
 [install.desktop]
 name = "FreeCAD"
@@ -428,6 +430,20 @@ icon = "~/.local/share/updatium/installs/freecad/current/icon.svg"   # optional
 categories = ["Graphics"]
 terminal = false
 ```
+
+`type = "deb"` installs a digest-verified `.deb` asset as a system package
+through `apt-get`; the default command is
+`sudo apt-get install -y --allow-downgrades <download>`, so sudo prompts on the
+controlling terminal when needed. For unattended runs, override it with
+`install_cmd` using a non-interactive prefix such as `sudo -n` (with
+passwordless sudo configured) or a privileged wrapper. `install_cmd` is argv,
+not a shell; every `{download}` token is replaced with the verified package
+path, or the path is appended when no token is present. Package maintainer
+scripts run as root, and
+the package owns its files and desktop entry, so `[install.desktop]`,
+`link_bins`, and `updatium desktop` integration do not apply. The package is not
+tracked under Updatium's install tree; configure `installed_version_cmd` (for
+example `["dpkg-query", "-W", "-f=${Version}", "<package>"]`) to observe it.
 
 ### Provider fields
 
@@ -687,6 +703,10 @@ Updatium process is using them before removing them.
 * **Archive safety** — zip/tar members are rejected on absolute paths, `..`
   escapes, and ALL symlink/hardlink members; formats are sniffed from magic
   bytes, not extensions.
+* **Package installers** — `.deb` assets are downloaded and digest-verified
+  before the configured install command runs. That command escalates privileges
+  (default `sudo apt-get`), so package maintainer scripts and their side
+  effects are trusted exactly like a manual system package installation.
 * **Symlink hygiene** — `~/.local/bin` entries are replaced only when they are
   our own symlinks pointing into this app's install tree; foreign files are
   never overwritten (reported as conflicts).
@@ -714,8 +734,8 @@ as builtin providers.
 
 ## Installer plugins
 
-Installation itself is pluggable. Builtins cover the three native shapes
-(`appimage`, `archive`, `dir`); anything else is delegated to an external
+Installation itself is pluggable. Builtins cover the native shapes
+(`appimage`, `archive`, `dir`, `deb`); anything else is delegated to an external
 installer plugin.
 
 **Discovery** — executables named `updatium-installer-*` on `PATH`, plus any

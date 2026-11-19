@@ -262,7 +262,7 @@ impl Default for DigestPolicy {
     }
 }
 
-/// How the engine installs a release. Builtins cover the three native shapes;
+/// How the engine installs a release. Builtins cover the native shapes;
 /// `External(name)` delegates installation to an installer plugin (registry key
 /// `external:<name>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,18 +270,20 @@ pub enum InstallType {
     Appimage,
     Archive,
     Dir,
+    Deb,
     None,
     External(String),
 }
 
 impl InstallType {
-    /// Registry key: `"appimage"` | `"archive"` | `"dir"` | `"external:<name>"`.
-    /// `None` never reaches registries.
+    /// Registry key: `"appimage"` | `"archive"` | `"dir"` | `"deb"` |
+    /// `"external:<name>"`. `None` never reaches registries.
     pub fn key(&self) -> String {
         match self {
             InstallType::Appimage => "appimage".into(),
             InstallType::Archive => "archive".into(),
             InstallType::Dir => "dir".into(),
+            InstallType::Deb => "deb".into(),
             InstallType::None => "none".into(),
             InstallType::External(n) => format!("external:{n}"),
         }
@@ -295,6 +297,7 @@ impl<'de> serde::Deserialize<'de> for InstallType {
             "appimage" => Ok(InstallType::Appimage),
             "archive" => Ok(InstallType::Archive),
             "dir" => Ok(InstallType::Dir),
+            "deb" => Ok(InstallType::Deb),
             "none" => Ok(InstallType::None),
             _ if s.starts_with("external:") => {
                 let name = &s["external:".len()..];
@@ -308,7 +311,7 @@ impl<'de> serde::Deserialize<'de> for InstallType {
             }
             other => Err(serde::de::Error::custom(format!(
                 "invalid install.type {other:?} (expected \"appimage\", \"archive\", \
-                 \"dir\", \"none\" or \"external:<name>\")"
+                 \"dir\", \"deb\", \"none\" or \"external:<name>\")"
             ))),
         }
     }
@@ -336,8 +339,14 @@ pub struct InstallCfg {
     /// names symlinked into ~/.local/bin
     pub link_bins: Vec<String>,
     pub desktop: Option<DesktopCfg>,
-    /// external installers only: per-invocation timeout
+    /// deb and external installers: per-invocation timeout
     pub timeout_secs: Option<u64>,
+    /// deb only: argv template for the package installation command. Every
+    /// `{download}` token is replaced with the verified .deb path; when no
+    /// token is present the path is appended. Defaults to
+    /// `sudo apt-get install -y --allow-downgrades {download}` (sudo prompts
+    /// on the controlling terminal when needed).
+    pub install_cmd: Option<Vec<String>>,
     /// Remaining `[install]` keys; only populated when `kind` is
     /// [`InstallType::External`] (passed through to the plugin as its config).
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -374,6 +383,7 @@ impl<'de> serde::Deserialize<'de> for InstallCfg {
                 let mut link_bins = Vec::new();
                 let mut desktop = None;
                 let mut timeout_secs = None;
+                let mut install_cmd = None;
                 let mut extra = BTreeMap::new();
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -383,6 +393,7 @@ impl<'de> serde::Deserialize<'de> for InstallCfg {
                         "link_bins" => link_bins = map.next_value()?,
                         "desktop" => desktop = map.next_value()?,
                         "timeout_secs" => timeout_secs = map.next_value()?,
+                        "install_cmd" => install_cmd = map.next_value()?,
                         other => {
                             extra.insert(other.to_string(), map.next_value::<serde_json::Value>()?);
                         }
@@ -396,6 +407,25 @@ impl<'de> serde::Deserialize<'de> for InstallCfg {
                         extra.keys().cloned().collect::<Vec<_>>().join(", ")
                     )));
                 }
+                let mut install_cmd = install_cmd;
+                match &kind {
+                    InstallType::Deb => {}
+                    // Keep pass-through config for external plugins unchanged.
+                    InstallType::External(_) => {
+                        if let Some(cmd) = install_cmd.take() {
+                            extra.insert(
+                                "install_cmd".into(),
+                                serde_json::to_value(cmd).map_err(serde::de::Error::custom)?,
+                            );
+                        }
+                    }
+                    _ if install_cmd.is_some() => {
+                        return Err(serde::de::Error::custom(
+                            "[install] install_cmd is only allowed with type = \"deb\"",
+                        ));
+                    }
+                    _ => {}
+                }
                 Ok(InstallCfg {
                     kind,
                     target,
@@ -403,6 +433,7 @@ impl<'de> serde::Deserialize<'de> for InstallCfg {
                     link_bins,
                     desktop,
                     timeout_secs,
+                    install_cmd,
                     extra,
                 })
             }
@@ -420,6 +451,7 @@ impl Default for InstallCfg {
             link_bins: Vec::new(),
             desktop: None,
             timeout_secs: None,
+            install_cmd: None,
             extra: BTreeMap::new(),
         }
     }
@@ -1065,6 +1097,65 @@ mod tests {
         let app = AppFile::parse(t, "apps.d/tool.toml").unwrap();
         assert_eq!(app.install.kind, InstallType::External("copytool".into()));
         assert_eq!(app.install.kind.key(), "external:copytool");
+    }
+
+    #[test]
+    fn deb_install_type_parses_with_default_and_custom_cmd() {
+        let t = r#"
+            id = "tool"
+            provider = "github-releases"
+            repo = "a/b"
+            [install]
+            type = "deb"
+        "#;
+        let app = AppFile::parse(t, "apps.d/tool.toml").unwrap();
+        assert_eq!(app.install.kind, InstallType::Deb);
+        assert_eq!(app.install.kind.key(), "deb");
+        assert_eq!(app.install.install_cmd, None);
+
+        let t = t.replace(
+            "type = \"deb\"",
+            "type = \"deb\"\ninstall_cmd = [\"dpkg\", \"-i\", \"{download}\"]\ntimeout_secs = 120",
+        );
+        let app = AppFile::parse(&t, "apps.d/tool.toml").unwrap();
+        assert_eq!(
+            app.install.install_cmd.as_deref(),
+            Some(&["dpkg".to_string(), "-i".to_string(), "{download}".to_string()][..])
+        );
+        assert_eq!(app.install.timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn install_cmd_passes_through_to_external_plugin() {
+        let t = r#"
+            id = "tool"
+            provider = "github-releases"
+            repo = "a/b"
+            [install]
+            type = "external:copytool"
+            install_cmd = ["dpkg", "-i", "{download}"]
+        "#;
+        let app = AppFile::parse(t, "apps.d/tool.toml").unwrap();
+        assert_eq!(app.install.install_cmd, None);
+        assert_eq!(
+            app.install.extra["install_cmd"],
+            serde_json::json!(["dpkg", "-i", "{download}"])
+        );
+    }
+
+    #[test]
+    fn install_cmd_rejected_for_non_deb_builtins() {
+        let t = r#"
+            id = "tool"
+            provider = "github-releases"
+            repo = "a/b"
+            [install]
+            type = "appimage"
+            install_cmd = ["true"]
+        "#;
+        let err = AppFile::parse(t, "apps.d/tool.toml").unwrap_err().to_string();
+        assert!(err.contains("install_cmd"), "{err}");
+        assert!(err.contains("type = \"deb\""), "{err}");
     }
 
     #[test]

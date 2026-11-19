@@ -1,5 +1,6 @@
 //! Installers: appimage / archive / dir publication with zip-slip and
-//! symlink-conflict guards. The ONLY module that touches untrusted archives.
+//! symlink-conflict guards, plus deb package installation. The ONLY module that
+//! touches untrusted archives.
 
 use crate::config::{GlobalConfig, HomePaths, InstallCfg};
 use std::collections::HashMap;
@@ -561,6 +562,78 @@ impl Installer for DirInstaller {
     }
 }
 
+/// Default `.deb` installation command. `sudo` prompts on the controlling
+/// terminal when needed, so a normal update stays a single command; apt
+/// resolves dependencies from the local package. Unattended callers should
+/// override `install_cmd` with a non-interactive prefix.
+fn default_deb_cmd() -> Vec<String> {
+    ["sudo", "apt-get", "install", "-y", "--allow-downgrades"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+struct DebInstaller;
+
+#[async_trait::async_trait]
+impl Installer for DebInstaller {
+    fn key(&self) -> String {
+        "deb".into()
+    }
+
+    fn core_desktop(&self) -> bool {
+        // The package owns its own desktop entry and file locations.
+        false
+    }
+
+    async fn install(&self, ctx: &InstallCtx) -> Result<InstallOutcome> {
+        let Some(download) = ctx.download else {
+            bail!("deb install requires a downloaded asset");
+        };
+        let template = ctx
+            .cfg
+            .install_cmd
+            .clone()
+            .unwrap_or_else(default_deb_cmd);
+        anyhow::ensure!(!template.is_empty(), "deb install_cmd must not be empty");
+        let download_str = download.to_string_lossy().into_owned();
+        let mut substituted = false;
+        let mut argv: Vec<String> = template
+            .iter()
+            .map(|arg| {
+                if arg.contains("{download}") {
+                    substituted = true;
+                    arg.replace("{download}", &download_str)
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect();
+        if !substituted {
+            argv.push(download_str);
+        }
+        let timeout = std::time::Duration::from_secs(ctx.cfg.timeout_secs.unwrap_or(600));
+        let out = crate::exec::run(&argv, None, timeout, true).await?;
+        anyhow::ensure!(
+            out.status,
+            "deb install command failed:\n{}",
+            out.stderr_tail
+        );
+        Ok(InstallOutcome {
+            actions: vec![format!(
+                "installed {} via `{}`",
+                download
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| download.display().to_string()),
+                argv.join(" ")
+            )],
+            exec_hint: None,
+            publication: None,
+        })
+    }
+}
+
 /// An external installer plugin executable (protocol v2 `install` verb).
 #[derive(Debug)]
 pub struct ExternalInstaller {
@@ -720,6 +793,7 @@ pub fn registry(global: &GlobalConfig) -> HashMap<String, Arc<dyn Installer>> {
     map.insert("appimage".into(), Arc::new(AppimageInstaller));
     map.insert("archive".into(), Arc::new(ArchiveInstaller));
     map.insert("dir".into(), Arc::new(DirInstaller));
+    map.insert("deb".into(), Arc::new(DebInstaller));
     for ext in discover_external(global) {
         let key = format!("external:{}", ext.basename);
         map.insert(key, Arc::new(ext));
@@ -801,6 +875,7 @@ pub fn describe_registry(global: &GlobalConfig) -> Vec<PluginInfo> {
         PluginInfo { key: "appimage".into(), kind: "builtin", path: None },
         PluginInfo { key: "archive".into(), kind: "builtin", path: None },
         PluginInfo { key: "dir".into(), kind: "builtin", path: None },
+        PluginInfo { key: "deb".into(), kind: "builtin", path: None },
     ];
     let mut ext: Vec<_> = discover_external(global)
         .into_iter()
@@ -1300,7 +1375,7 @@ mod plugin_tests {
         let dir = tempfile::tempdir().unwrap();
         let g = test_global(dir.path());
         let reg = registry(&g);
-        for key in ["appimage", "archive", "dir"] {
+        for key in ["appimage", "archive", "dir", "deb"] {
             assert_eq!(lookup(&reg, key).unwrap().key(), key);
         }
         let err = match lookup(&reg, "nope") {
@@ -1309,6 +1384,110 @@ mod plugin_tests {
         };
         assert!(err.contains("unknown installer 'nope'"), "{err}");
         assert!(err.contains("appimage") && err.contains("archive") && err.contains("dir"), "{err}");
+        assert!(err.contains("deb"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn deb_installer_substitutes_download_and_runs_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = test_global(dir.path());
+        let package = dir.path().join("tool_1.0_amd64.deb");
+        std::fs::write(&package, b"not a real package").unwrap();
+        let marker = dir.path().join("called-with");
+        let cfg = InstallCfg {
+            kind: crate::config::InstallType::Deb,
+            install_cmd: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                format!("printf '%s\\n' \"$1\" > {}", marker.display()),
+                "--".into(),
+                "{download}".into(),
+            ]),
+            ..Default::default()
+        };
+        let extra = empty_table();
+        let ctx = InstallCtx {
+            app_id: "demo",
+            version: "1.0",
+            cfg: &cfg,
+            extra: &extra,
+            download: Some(&package),
+            filename: Some("tool_1.0_amd64.deb"),
+            checkout: None,
+            artifacts: &[],
+            home: &g.home,
+            on_extracted: None,
+        };
+        let outcome = DebInstaller.install(&ctx).await.unwrap();
+        assert!(outcome.publication.is_none());
+        assert!(outcome.exec_hint.is_none());
+        assert!(outcome.actions[0].contains("tool_1.0_amd64.deb"), "{:?}", outcome.actions);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            package.to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    async fn deb_installer_appends_download_without_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = test_global(dir.path());
+        let package = dir.path().join("tool.deb");
+        std::fs::write(&package, b"x").unwrap();
+        let marker = dir.path().join("args");
+        let cfg = InstallCfg {
+            kind: crate::config::InstallType::Deb,
+            install_cmd: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                format!("printf '%s\\n' \"$@\" > {}", marker.display()),
+                "--".into(),
+            ]),
+            ..Default::default()
+        };
+        let extra = empty_table();
+        let ctx = InstallCtx {
+            app_id: "demo",
+            version: "1.0",
+            cfg: &cfg,
+            extra: &extra,
+            download: Some(&package),
+            filename: Some("tool.deb"),
+            checkout: None,
+            artifacts: &[],
+            home: &g.home,
+            on_extracted: None,
+        };
+        DebInstaller.install(&ctx).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            package.to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    async fn deb_installer_bails_without_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = test_global(dir.path());
+        let cfg = InstallCfg {
+            kind: crate::config::InstallType::Deb,
+            ..Default::default()
+        };
+        let extra = empty_table();
+        let ctx = InstallCtx {
+            app_id: "demo",
+            version: "1.0",
+            cfg: &cfg,
+            extra: &extra,
+            download: None,
+            filename: None,
+            checkout: None,
+            artifacts: &[],
+            home: &g.home,
+            on_extracted: None,
+        };
+        let err = DebInstaller.install(&ctx).await.unwrap_err().to_string();
+        assert!(err.contains("requires a downloaded asset"), "{err}");
     }
 
     #[test]

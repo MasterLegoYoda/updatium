@@ -108,7 +108,7 @@ fn destination(app: &AppFile, home: &HomePaths) -> Result<Option<PathBuf>> {
                 Some(home.install_current(&app.id))
             }
             InstallType::Dir => Some(home.install_current(&app.id)),
-            InstallType::None | InstallType::External(_) => None,
+            InstallType::None | InstallType::External(_) | InstallType::Deb => None,
         },
     };
     if let Some(path) = &dest {
